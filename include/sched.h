@@ -1,5 +1,5 @@
-#ifndef QUEUE_H
-#define QUEUE_H
+#ifndef SCHED_H
+#define SCHED_H
 
 #include "common.h"
 
@@ -15,14 +15,14 @@ extern "C" {
 
 int queue_empty(void);
 
-void init_scheduler(void);
-void finish_scheduler(void);
+void init_scheduler(void); // Initialize the scheduler
+void finish_scheduler(void); // Finish, Clean the scheduler
 
 /* Get the next process from ready queue */
 struct pcb_t * get_proc(void);
 
 /* Put a process back to run queue */
-void put_proc(struct pcb_t * proc);
+void put_proc(struct pcb_t * proc); // End time slice
 
 /* Add a new process to ready queue */
 void add_proc(struct pcb_t * proc);
