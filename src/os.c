@@ -74,6 +74,8 @@ struct cpu_args {
  *  - every slot, this thread must call next_slot() exactly once
  *  - when it exits, it must call detach_event()
  */
+
+ //lấy proc mới
 static void *cpu_routine(void *args)
 {
 	struct timer_id_t *timer_id = ((struct cpu_args *)args)->timer_id;
@@ -147,6 +149,7 @@ static void *co_processor(void *arg)
 }
 #endif
 
+//khởi tạo OS (kernel)
 static void *ld_routine(void *args)
 {
 #ifdef MM_PAGING
@@ -223,6 +226,7 @@ static void *ld_routine(void *args)
 	pthread_exit(NULL);
 }
 
+//đọc file config để khởi tạo cấu hình
 static void read_config(const char *path)
 {
 	FILE *file;
