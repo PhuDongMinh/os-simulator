@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #ifndef OSCFG_H
 #include "os-cfg.h"
@@ -20,6 +21,7 @@
 #define SECOND_LV_LEN 5
 #define SEGMENT_LEN FIRST_LV_LEN
 #define PAGE_LEN SECOND_LV_LEN
+#define MAX_PROCESS_REGISTRY 128
 
 #define NUM_PAGES (1 << (ADDRESS_SIZE - OFFSET_LEN))
 #define PAGE_SIZE (1 << OFFSET_LEN)
@@ -125,6 +127,10 @@ struct krnl_t
 {
 	struct queue_t *ready_queue;
 	struct queue_t *running_list;
+	
+	struct pcb_t *proc_registry[MAX_PROCESS_REGISTRY];
+    void *registry_lock;
+
 #ifdef MLQ_SCHED
 	struct queue_t *mlq_ready_queue;
 #endif
