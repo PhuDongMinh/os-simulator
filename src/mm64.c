@@ -550,4 +550,42 @@ int print_pgtbl(struct pcb_t *caller, addr_t start, addr_t end)
   return 0;
 }
 
+/*
+ * pte_clear_entry - Xóa trắng một Page Table Entry (PTE)
+ * @mm    : memory region (của User hoặc Kernel)
+ * @pgn   : page number (PGN)
+ * @caller: caller process
+ */
+int pte_clear_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
+{
+  addr_t *pte = NULL;
+  
+#ifdef MM64 
+  addr_t pgd, p4d, pud, pmd, pt;
+  
+  // 1. Tách PGN ra thành 5 mức chỉ mục
+  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
+
+  /*  CHƯA LÀMMMMMMM ANH PHÚ LÀM NHA ANH PHÚUUUUU ===========================
+   * TODO: Traverse (Duyệt) qua 5 mức phân trang để tìm đúng con trỏ PTE.
+   * Đoạn này sẽ phụ thuộc vào cách cấp phát mảng đa mức sắp tới.
+   * Ví dụ:
+   * pte = truy_vet_pointer_5_muc(mm, pgd, p4d, pud, pmd, pt);
+   */
+   
+#else
+  // Hỗ trợ fallback cho 32-bit
+  if (mm == caller->krnl->mm) {
+      pte = &caller->krnl->krnl_pgd[pgn];
+  } else {
+      pte = &mm->pgd[pgn];
+  }
+#endif
+
+  // 2. Gán toàn bộ bit về 0 (Tự động xóa sạch cờ PRESENT, SWAP và FPN)
+  if (pte != NULL) *pte = 0;
+
+  return 0;
+}
+
 #endif  //def MM64

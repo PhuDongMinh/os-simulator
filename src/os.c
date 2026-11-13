@@ -87,6 +87,24 @@ static void *cpu_routine(void *args)
 		/* 1. Handle the current process, if any */
 		if (proc != NULL) {
 			if (proc->pc == proc->code->size) {
+				/*Gỡ đăng ký trước khi free*/
+				pthread_mutex_lock((pthread_mutex_t *)proc->krnl->registry_lock);
+				for (int j = 0; j < MAX_PROCESS_REGISTRY; j++) {
+					if (proc->krnl->proc_registry[j] == proc) {
+						proc->krnl->proc_registry[j] = NULL;
+						break;
+					}
+				}
+            	pthread_mutex_unlock((pthread_mutex_t *)proc->krnl->registry_lock);
+
+				for (int k = 0; k < proc->num_kmaps; k++) {
+					__kfree(proc, 0, proc->kmap_rgid[k]); 
+				}
+
+				/* Thu hồi user memory */
+				free_pcb_memph(proc); // Thu hồi toàn bộ frame trên RAM/SWAP của user
+				if (proc->mm != NULL) free(proc->mm);   // Giải phóng cấu trúc mm_struct
+
 				/* The process has finished its job */
 				printf("\tCPU %d: Processed %2d has finished\n",
 				       id, proc->pid);
@@ -184,8 +202,21 @@ static void *ld_routine(void *args)
 	while (i < num_processes) {
 		struct pcb_t *proc = load(ld_processes.path[i]);
 
+		/* Khởi tạo biến đếm kernel map */
+        proc->num_kmaps = 0;
+
 		/* sched.c uses proc->krnl, so this must always be set */
 		proc->krnl = &os;
+
+		/*Đăng ký tiến trình mới vào Kernel Registry*/
+		pthread_mutex_lock((pthread_mutex_t *)os.registry_lock);
+		for (int j = 0; j < MAX_PROCESS_REGISTRY; j++) {
+			if (os.proc_registry[j] == NULL) {
+				os.proc_registry[j] = proc;
+				break;
+			}
+		}
+		pthread_mutex_unlock((pthread_mutex_t *)os.registry_lock);
 
 #ifdef MLQ_SCHED
 		if (ld_processes.prio[i] >= MAX_PRIO) {
@@ -343,6 +374,13 @@ int main(int argc, char *argv[])
 	mm_ld_args->active_mswp = (struct memphy_struct *)&mswp[0];
 	mm_ld_args->active_mswp_id = 0;
 #endif
+
+	/*Khởi tạo Process Registry cho Kernel*/
+	os.registry_lock = malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init((pthread_mutex_t *)os.registry_lock, NULL);
+    for (int j = 0; j < MAX_PROCESS_REGISTRY; j++) {
+        os.proc_registry[j] = NULL;
+    }
 
 	/* Init scheduler */
 	init_scheduler();

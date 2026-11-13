@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #ifndef OSCFG_H
 #include "os-cfg.h"
@@ -20,6 +21,7 @@
 #define SECOND_LV_LEN 5
 #define SEGMENT_LEN FIRST_LV_LEN
 #define PAGE_LEN SECOND_LV_LEN
+#define MAX_PROCESS_REGISTRY 128
 
 #define NUM_PAGES (1 << (ADDRESS_SIZE - OFFSET_LEN))
 #define PAGE_SIZE (1 << OFFSET_LEN)
@@ -118,6 +120,9 @@ struct pcb_t
 	struct krnl_t *krnl;	
 	struct page_table_t *page_table; // Page table
 	uint32_t bp;			 // Break pointer
+
+	int kmap_rgid[10]; // Mảng lưu các rgid tiến trình đã xin từ Kernel
+    int num_kmaps;     // Số lượng vùng nhớ Kernel đang giữ
 };
 
 /* Kernel structure */
@@ -125,6 +130,10 @@ struct krnl_t
 {
 	struct queue_t *ready_queue;
 	struct queue_t *running_list;
+	
+	struct pcb_t *proc_registry[MAX_PROCESS_REGISTRY];
+    void *registry_lock;
+
 #ifdef MLQ_SCHED
 	struct queue_t *mlq_ready_queue;
 #endif
