@@ -97,6 +97,14 @@ static void *cpu_routine(void *args)
 				}
             	pthread_mutex_unlock((pthread_mutex_t *)proc->krnl->registry_lock);
 
+				for (int k = 0; k < proc->num_kmaps; k++) {
+					__kfree(proc, 0, proc->kmap_rgid[k]); 
+				}
+
+				/* Thu hồi user memory */
+				free_pcb_memph(proc); // Thu hồi toàn bộ frame trên RAM/SWAP của user
+				if (proc->mm != NULL) free(proc->mm);   // Giải phóng cấu trúc mm_struct
+
 				/* The process has finished its job */
 				printf("\tCPU %d: Processed %2d has finished\n",
 				       id, proc->pid);
@@ -193,6 +201,9 @@ static void *ld_routine(void *args)
 
 	while (i < num_processes) {
 		struct pcb_t *proc = load(ld_processes.path[i]);
+
+		/* Khởi tạo biến đếm kernel map */
+        proc->num_kmaps = 0;
 
 		/* sched.c uses proc->krnl, so this must always be set */
 		proc->krnl = &os;

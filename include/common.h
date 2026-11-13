@@ -120,6 +120,9 @@ struct pcb_t
 	struct krnl_t *krnl;	
 	struct page_table_t *page_table; // Page table
 	uint32_t bp;			 // Break pointer
+
+	int kmap_rgid[10]; // Mảng lưu các rgid tiến trình đã xin từ Kernel
+    int num_kmaps;     // Số lượng vùng nhớ Kernel đang giữ
 };
 
 /* Kernel structure */
