@@ -18,8 +18,39 @@
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
 
 #if defined(MM64)
+
+static struct mm_struct *get_target_mm(struct mm_struct *mm, struct pcb_t *caller)
+{
+  if (mm != NULL)
+    return mm;
+  if (caller != NULL)
+  {
+    if (caller->mm != NULL)
+      return caller->mm;
+    if (caller->krnl != NULL && caller->krnl->mm != NULL)
+      return caller->krnl->mm;
+  }
+  return NULL;
+}
+
+static void ensure_mm_tables(struct mm_struct *mm)
+{
+  if (mm == NULL)
+    return;
+  if (mm->pgd == NULL)
+    mm->pgd = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  if (mm->p4d == NULL)
+    mm->p4d = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  if (mm->pud == NULL)
+    mm->pud = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  if (mm->pmd == NULL)
+    mm->pmd = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  if (mm->pt == NULL)
+    mm->pt = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+}
 
 /*
  * init_pte - Initialize PTE entry
@@ -125,6 +156,16 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
   //... krnl->mm->pgd
   //... krnl->mm->pt
   //pte = &krnl->mm->pt;
+  free(pte);
+  struct mm_struct *target_mm = get_target_mm(NULL, caller);
+  if (target_mm == NULL && krnl != NULL)
+    target_mm = krnl->mm;
+  ensure_mm_tables(target_mm);
+  target_mm->pgd[pgd] = (addr_t)&target_mm->p4d[p4d];
+  target_mm->p4d[p4d] = (addr_t)&target_mm->pud[pud];
+  target_mm->pud[pud] = (addr_t)&target_mm->pmd[pmd];
+  target_mm->pmd[pmd] = (addr_t)&target_mm->pt[pt];
+  pte = &target_mm->pt[pt];
 #else
   pte = &krnl->mm->pgd[pgn];
 #endif
@@ -164,6 +205,16 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *call
   //... krnl->mm->pgd
   //... krnl->mm->pt
   //pte = &krnl->mm->pt;
+  free(pte);
+  struct mm_struct *target_mm = get_target_mm(mm, caller);
+  if (target_mm == NULL && krnl != NULL)
+    target_mm = krnl->mm;
+  ensure_mm_tables(target_mm);
+  target_mm->pgd[pgd] = (addr_t)&target_mm->p4d[p4d];
+  target_mm->p4d[p4d] = (addr_t)&target_mm->pud[pud];
+  target_mm->pud[pud] = (addr_t)&target_mm->pmd[pmd];
+  target_mm->pmd[pmd] = (addr_t)&target_mm->pt[pt];
+  pte = &target_mm->pt[pt];
 #else
   pte = &krnl->mm->pgd[pgn];
 #endif
@@ -203,6 +254,13 @@ addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller)
   //... krnl->mm->pgd
   //... krnl->mm->pt
   //pte = &krnl->mm->pt;
+  free(pte);
+  struct mm_struct *target_mm = get_target_mm(mm, caller);
+  if (target_mm == NULL && krnl != NULL)
+    target_mm = krnl->mm;
+  ensure_mm_tables(target_mm);
+  pte = &target_mm->pt[pt];
+  return *pte;
 #else	
   pte = &krnl->mm->pgd[pgn];
 #endif
@@ -235,6 +293,17 @@ int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb
   //... krnl->mm->pgd
   //... krnl->mm->pt
   //pte = &krnl->mm->pt;
+  free(pte);
+  struct mm_struct *target_mm = get_target_mm(mm, caller);
+  if (target_mm == NULL && krnl != NULL)
+    target_mm = krnl->mm;
+  ensure_mm_tables(target_mm);
+  target_mm->pgd[pgd] = (addr_t)&target_mm->p4d[p4d];
+  target_mm->p4d[p4d] = (addr_t)&target_mm->pud[pud];
+  target_mm->pud[pud] = (addr_t)&target_mm->pmd[pmd];
+  target_mm->pmd[pmd] = (addr_t)&target_mm->pt[pt];
+  pte = &target_mm->pt[pt];
+  *pte = pte_val;
 #else	
   pte = pte_val;
 #endif
@@ -254,6 +323,17 @@ int vmap_pgd_memset(struct pcb_t *caller,           // process call
 
   /* TODO memset the page table with given pattern
    */
+  int pgit = 0;
+  uint64_t pattern = 0xdeadbeef;
+  struct mm_struct *mm = get_target_mm(NULL, caller);
+  if (mm == NULL)
+    return -1;
+  ensure_mm_tables(mm);
+  addr_t base_pgn = addr >> PAGING64_ADDR_PT_SHIFT;
+  for (pgit = 0; pgit < pgnum; pgit++)
+  {
+    pte_set_entry(mm, base_pgn + pgit, pattern, caller);
+  }
 
   return 0;
 }
@@ -287,6 +367,31 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
   /* Tracking for later page replacement activities (if needed)
    * Enqueue new usage page */
   //enlist_pgn_node(&caller->krnl->mm->fifo_pgn, pgn64 + pgit);
+
+  struct framephy_struct *fpit = frames;
+  int pgit = 0;
+  addr_t pgn;
+  struct mm_struct *mm = get_target_mm(NULL, caller);
+  if (mm == NULL)
+    return -1;
+  ensure_mm_tables(mm);
+
+  if (ret_rg != NULL)
+  {
+    ret_rg->rg_start = addr;
+    ret_rg->rg_end = addr + (addr_t)pgnum * PAGING64_PAGESZ;
+  }
+
+  addr_t base_pgn = addr >> PAGING64_ADDR_PT_SHIFT;
+  for (pgit = 0; pgit < pgnum; pgit++)
+  {
+    if (fpit == NULL)
+      break;
+    pgn = base_pgn + pgit;
+    pte_set_fpn(mm, pgn, fpit->fpn, caller);
+    enlist_pgn_node(&mm->fifo_pgn, pgn);
+    fpit = fpit->fp_next;
+  }
 
   return 0;
 }
@@ -327,6 +432,73 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
 
 
   /* End TODO */
+  addr_t fpn = 0;
+  int pgit;
+  struct framephy_struct *newfp_str = NULL;
+  struct framephy_struct *tail = NULL;
+  struct mm_struct *mm = get_target_mm(NULL, caller);
+
+  if (caller == NULL || caller->krnl == NULL || frm_lst == NULL)
+    return -1;
+
+  *frm_lst = NULL;
+
+  for (pgit = 0; pgit < req_pgnum; pgit++)
+  {
+    if (caller->krnl->mram != NULL && MEMPHY_get_freefp(caller->krnl->mram, &fpn) == 0)
+    {
+    }
+    else
+    {
+      addr_t vicpgn = 0;
+      addr_t swpfpn = 0;
+      if (mm != NULL &&
+          find_victim_page(mm, &vicpgn) == 0 &&
+          caller->krnl->active_mswp != NULL &&
+          MEMPHY_get_freefp(caller->krnl->active_mswp, &swpfpn) == 0)
+      {
+        addr_t vicpte = pte_get_entry(mm, vicpgn, caller);
+        addr_t vicfpn = PAGING_FPN(vicpte);
+        __swap_cp_page(caller->krnl->mram, vicfpn, caller->krnl->active_mswp, swpfpn);
+        pte_set_swap(caller, vicpgn, caller->krnl->active_mswp_id, swpfpn);
+        fpn = vicfpn;
+      }
+      else if (caller->krnl->active_mswp != NULL &&
+               MEMPHY_get_freefp(caller->krnl->active_mswp, &fpn) == 0)
+      {
+      }
+      else
+      {
+        struct framephy_struct *cur = *frm_lst;
+        while (cur != NULL)
+        {
+          struct framephy_struct *next = cur->fp_next;
+          if (caller->krnl->mram != NULL)
+            MEMPHY_put_freefp(caller->krnl->mram, cur->fpn);
+          free(cur);
+          cur = next;
+        }
+        *frm_lst = NULL;
+        return (addr_t)-3000;
+      }
+    }
+
+    newfp_str = (struct framephy_struct *)malloc(sizeof(struct framephy_struct));
+    newfp_str->fpn = fpn;
+    newfp_str->owner = mm;
+    newfp_str->fp_next = NULL;
+
+    if (*frm_lst == NULL)
+    {
+      *frm_lst = newfp_str;
+      tail = newfp_str;
+    }
+    else
+    {
+      tail->fp_next = newfp_str;
+      tail = newfp_str;
+    }
+  }
 
   return 0;
 }
@@ -416,6 +588,12 @@ int init_mm(struct mm_struct *mm, struct pcb_t *caller)
    //mm->pud = ...
    //mm->pmd = ...
    //mm->pt = ...
+  mm->pgd = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  mm->p4d = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  mm->pud = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  mm->pmd = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  mm->pt = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+  vma0->vm_freerg_list = NULL;
 
 
   /* By default the owner comes with at least one vma */
@@ -428,14 +606,20 @@ int init_mm(struct mm_struct *mm, struct pcb_t *caller)
 
   /* TODO update VMA0 next */
   // vma0->next = ...
+  vma0->vm_next = NULL;
 
   /* Point vma owner backward */
   //vma0->vm_mm = mm; 
+  vma0->vm_mm = mm;
 
   /* TODO: update mmap */
   //mm->mmap = ...
   //mm->symrgtbl = ...
   //mm->kcpooltbl
+  mm->mmap = vma0;
+  memset(mm->symrgtbl, 0, PAGING_MAX_SYMTBL_SZ * sizeof(struct vm_rg_struct));
+  mm->fifo_pgn = NULL;
+  mm->kcpooltbl = NULL;
 
   return 0;
 }
@@ -546,6 +730,16 @@ int print_pgtbl(struct pcb_t *caller, addr_t start, addr_t end)
   get_pd_from_address(start, &pgd, &p4d, &pud, &pmd, &pt);
 
   /* TODO traverse the page map and dump the page directory entries */
+  struct mm_struct *mm = get_target_mm(NULL, caller);
+  if (mm == NULL)
+    return -1;
+  ensure_mm_tables(mm);
+  printf(" PDG=" FORMATX_ADDR " P4D=" FORMATX_ADDR " PUD=" FORMATX_ADDR " PMD=" FORMATX_ADDR "PT=" FORMATX_ADDR "\n",
+         (void *)&mm->pgd[pgd],
+         (void *)&mm->p4d[p4d],
+         (void *)&mm->pud[pud],
+         (void *)&mm->pmd[pmd],
+         (void *)&mm->pt[pt]);
 
   return 0;
 }
