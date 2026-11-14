@@ -75,6 +75,7 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
   struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
   int inc_sz=0;
 
+  //vma đó còn đủ chỗ để cấp phát (get trả về 0) -> cập nhật vma, trả về alloc_addr = start
   if (get_free_vmrg_area(caller, vmaid, size, &rgnode) == 0)
   {
     caller->mm->symrgtbl[rgid].rg_start = rgnode.rg_start;
@@ -441,47 +442,16 @@ int libwrite(
 }
 
 /* Hàm hỗ trợ: Tìm và lấy N frame vật lý liên tục từ MEMPHY (RAM) */
-int MEMPHY_get_freefp_contig(struct memphy_struct *mp, int num_pages, int *ret_fpn) {
-  if (mp == NULL || num_pages <= 0) return -1;
-    
-  struct framephy_struct *curr = mp->free_fp_list;
-  struct framephy_struct *start_node = curr;
-  struct framephy_struct *prev = NULL;
-  struct framephy_struct *start_prev = NULL;
-  int count = 1;
-    
-  while (curr != NULL && curr->fp_next != NULL) {
-    if (curr->fp_next->fpn == curr->fpn + 1) {
-      count++;
-      if (count == num_pages) {
-        *ret_fpn = start_node->fpn;
-        
-        /* Cắt dải node liên tục này ra khỏi danh sách free_fp_list */
-        if (start_prev == NULL) {
-          mp->free_fp_list = curr->fp_next->fp_next;
-        } else {
-          start_prev->fp_next = curr->fp_next->fp_next;
-        }
-                
-        /* Xóa các node đã lấy để tránh leak memory (nếu struct yêu cầu) */
-        struct framephy_struct *temp = start_node;
-        while (count > 0) {
-          struct framephy_struct *next_temp = temp->fp_next;
-          free(temp);
-          temp = next_temp;
-          count--;
-        }
-        return 0; // Thành công
-      }
-    } else {
-      start_node = curr->fp_next;
-      start_prev = curr;
-      count = 1;
-    }
-    prev = curr;
-    curr = curr->fp_next;
-  }
-  return -1; // Không đủ frame liên tục
+int MEMPHY_get_freefp_contig(struct memphy_struct *mp, int num_pages, int *ret_fpn)
+{
+  addr_t first;
+  if (ret_fpn == NULL) return -1;
+
+  /* Uses the same physical-memory lock and ownership lists as single-frame
+   * allocation. maxsz is int, so every valid FPN also fits in int. */
+  if (MEMPHY_get_freefp_range(mp, num_pages, &first) != 0) return -1;
+  *ret_fpn = (int)first;
+  return 0;
 }
 
 /*libkmem_malloc- alloc region memory in kmem

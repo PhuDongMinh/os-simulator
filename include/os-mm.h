@@ -143,7 +143,9 @@ struct memphy_struct {
    int rdmflg;
    int cursor;
 
-   /* Management structure */
+   /* MEMPHY owns these nodes: sorted free list <-> checked-out used list.
+    * Each complete physical frame occurs in exactly one list. Mutate only
+    * through synchronized MEMPHY APIs; owner is reserved (NULL for now). */
    struct framephy_struct *free_fp_list;
    struct framephy_struct *used_fp_list;
 };

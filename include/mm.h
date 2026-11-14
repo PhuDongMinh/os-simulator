@@ -166,8 +166,16 @@ int find_victim_page(struct mm_struct* mm, addr_t *pgn);
 struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid);
 
 /* MEM/PHY protypes */
+/* Internally synchronized. Format/init need an initialized/fresh device,
+ * respectively; init must not overwrite a live device. */
+int MEMPHY_format(struct memphy_struct *mp, int pagesz);
+int MEMPHY_get_freefp_range(struct memphy_struct *mp, int count, addr_t *fpn);
+int MEMPHY_get_freefp_contig(struct memphy_struct *mp, int count, int *fpn);
 int MEMPHY_get_freefp(struct memphy_struct *mp, addr_t *fpn);
 int MEMPHY_put_freefp(struct memphy_struct *mp, addr_t fpn);
+int MEMPHY_mv_csr(struct memphy_struct *mp, addr_t offset);
+int MEMPHY_seq_read(struct memphy_struct *mp, addr_t addr, BYTE *value);
+int MEMPHY_seq_write(struct memphy_struct *mp, addr_t addr, BYTE value);
 int MEMPHY_read(struct memphy_struct * mp, addr_t addr, BYTE *value);
 int MEMPHY_write(struct memphy_struct * mp, addr_t addr, BYTE data);
 int MEMPHY_dump(struct memphy_struct * mp);
