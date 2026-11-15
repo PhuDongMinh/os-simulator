@@ -22,7 +22,7 @@ vpath %.c $(SRC)
 vpath %.cpp $(SRC)
 vpath %.h $(INCLUDE)
 
-CFLAGS =   -std=gnu11 -c $(DEBUG)
+CFLAGS =   -std=gnu11 -c $(DEBUG) -DUSE_DMA
 CXXFLAGS = -std=gnu++14 -c $(DEBUG)
 
 # Verilator configuration
