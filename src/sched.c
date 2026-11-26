@@ -25,13 +25,20 @@ static int slot[MAX_PRIO];
 #endif
 
 int queue_empty(void) {
+	int result;
+	pthread_mutex_lock(&queue_lock);
+	result = empty(&ready_queue) && empty(&run_queue);
 #ifdef MLQ_SCHED
 	unsigned long prio;
-	for (prio = 0; prio < MAX_PRIO; prio++)
-		if(!empty(&mlq_ready_queue[prio])) 
-			return -1;
+	for (prio = 0; prio < MAX_PRIO; prio++) {
+		if (!empty(&mlq_ready_queue[prio])) {
+			result = -1;
+			break;
+		}
+	}
 #endif
-	return (empty(&ready_queue) && empty(&run_queue));
+	pthread_mutex_unlock(&queue_lock);
+	return result;
 }
 
 void init_scheduler(void) {
@@ -62,31 +69,34 @@ void finish_scheduler(void) {
  */
 struct pcb_t * get_mlq_proc(void) {
 	struct pcb_t * proc = NULL;
+	int first_nonempty = MAX_PRIO;
+	int prio;
 
 	pthread_mutex_lock(&queue_lock);
 	/*TODO: get a process from PRIORITY [ready_queue].
 	 *      It worth to protect by a mechanism.
 	 * */
 	
-	if (queue_empty() == -1) {
-		do {
-			for (int prio = 0; prio < MAX_PRIO; prio++) {
-				if (!empty(&mlq_ready_queue[prio]) && slot[prio] > 0) {
-					proc = dequeue(&mlq_ready_queue[prio]);
-					slot[prio]--;
-					break;
-				}
-			}
-			if (proc == NULL) {
-				for (int prio = 0; prio < MAX_PRIO; prio++) {
-					slot[prio] = MAX_PRIO - prio;
-				}
-			}
-		} while (proc == NULL);
+	for (prio = 0; prio < MAX_PRIO; prio++) {
+		if (empty(&mlq_ready_queue[prio]))
+			continue;
+		if (slot[prio] > 0)
+			break;
+		if (first_nonempty == MAX_PRIO)
+			first_nonempty = prio;
 	}
-	if (proc != NULL)
+	if (prio == MAX_PRIO && first_nonempty < MAX_PRIO) {
+		for (int i = 0; i < MAX_PRIO; i++)
+			slot[i] = MAX_PRIO - i;
+		prio = first_nonempty;
+	}
+	if (prio < MAX_PRIO) {
+		proc = dequeue(&mlq_ready_queue[prio]);
+		slot[prio]--;
 		enqueue(&running_list, proc);
-	return proc;	
+	}
+	pthread_mutex_unlock(&queue_lock);
+	return proc;
 }
 
 void put_mlq_proc(struct pcb_t * proc) {
