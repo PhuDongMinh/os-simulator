@@ -7,12 +7,35 @@
 #include <stdio.h>
 #include <pthread.h>
 
+
 #ifndef OSCFG_H
 #include "os-cfg.h"
 #endif
 
 #ifndef OSMM_H
 #include "os-mm.h"
+#endif
+
+#ifdef MM64
+#define USER_SPACE_START   0x0000000000001000ULL 
+#define USER_SPACE_END     0x00FFFFFFFFFFFFFFULL 
+#define KERNEL_SPACE_START 0xFF00000000000000ULL 
+#define KERNEL_SPACE_END   0xFFFFFFFFFFFFFFFFULL
+
+#define OS_PAGESZ          ((addr_t)PAGING64_PAGESZ)
+#define OS_PAGE_ALIGN(sz)  ((addr_t)PAGING64_PAGE_ALIGNSZ(sz))
+#define OS_VADDR_PGN(addr) ((addr_t)(addr) >> PAGING64_ADDR_PT_SHIFT)
+#define OS_VADDR_OFF(addr) ((addr_t)(addr) & (OS_PAGESZ - 1))
+#else
+#define USER_SPACE_START   0x00000100U
+#define USER_SPACE_END     0x003FFFFFU
+#define KERNEL_SPACE_START 0x80000000U
+#define KERNEL_SPACE_END   0xFFFFFFFFU
+
+#define OS_PAGESZ          ((addr_t)PAGING_PAGESZ)
+#define OS_PAGE_ALIGN(sz)  ((addr_t)PAGING_PAGE_ALIGNSZ(sz))
+#define OS_VADDR_PGN(addr) ((addr_t)PAGING_PGN(addr))
+#define OS_VADDR_OFF(addr) ((addr_t)PAGING_OFFST(addr))
 #endif
 
 #define ADDRESS_SIZE 20
@@ -121,8 +144,7 @@ struct pcb_t
 	struct page_table_t *page_table; // Page table
 	uint32_t bp;			 // Break pointer
 
-	int kmap_rgid[10]; // Mảng lưu các rgid tiến trình đã xin từ Kernel
-    int num_kmaps;     // Số lượng vùng nhớ Kernel đang giữ
+	int kmap_slot[PAGING_MAX_SYMTBL_SZ];   //Anh xa rgid cua proc -> slot trong os.mm->symrgtbl (-1 neu trong)
 };
 
 /* Kernel structure */

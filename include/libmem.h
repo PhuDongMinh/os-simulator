@@ -8,6 +8,9 @@
  * for the sole purpose of studying while attending the course CO2018.
  */
 
+#ifndef LIBMEM_H
+#define LIBMEM_H
+
 #include "common.h"
 
 #define SYSMEM_MAP_OP 1
@@ -25,3 +28,7 @@ int libkmem_malloc(struct pcb_t*, uint32_t, uint32_t);
 int libkmem_copy_from_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libkmem_copy_to_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libmem_dma_memcpy(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+
+int __kfree(struct pcb_t *caller, int vmaid, int rgid);
+int libkmem_free(struct pcb_t *caller, uint32_t reg_index);
+#endif

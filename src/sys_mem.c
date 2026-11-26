@@ -44,7 +44,7 @@ struct pcb_t *get_pcb_by_pid(struct krnl_t *krnl, uint32_t pid)
 int __sys_memmap(struct krnl_t *krnl, uint32_t pid, struct sc_regs *regs)
 {
         int memop = regs->a1;
-        BYTE value;
+        BYTE value = 0;
         /*
          * TODO THIS DUMMY CREATE EMPTY PROC TO AVOID COMPILER NOTIFY
          *      need to be eliminated
@@ -96,7 +96,7 @@ int __sys_memmap(struct krnl_t *krnl, uint32_t pid, struct sc_regs *regs)
                 break;
         case SYSMEM_IO_READ:
                 stat = MEMPHY_read(krnl->mram, regs->a2, &value);
-                regs->a3 = value;  //Tra du lieu doc duoc qua reg a3
+                if (stat == 0) regs->a3 = value;  //Tra du lieu doc duoc qua reg a3
                 printf("[SYSCALL] sys_memmap IO_READ pid=%d addr=%lu value=%u\n", caller->pid, regs->a2, value);
                 break;
         case SYSMEM_IO_WRITE:
