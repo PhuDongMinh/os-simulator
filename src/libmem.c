@@ -671,108 +671,336 @@ addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t 
 
 
 
+/* ------------------------------------------------------------------------
+ * DMA memcpy support
+ *
+ * libmem_dma_memcpy() turns "copy SIZE bytes at OFFSET from region SRC to
+ * region DST" (regions of the calling process) into a list of PHYSICAL
+ * copies and queues them for the DMA worker (dma_submit). It returns as
+ * soon as they are queued: the process does not wait for the copy.
+ *
+ *  - Both regions must exist and OFFSET + SIZE must fit in both.
+ *  - A copy is cut at every page boundary of the source and of the
+ *    destination (consecutive virtual pages may sit in distant frames);
+ *    cuts that turn out to be physically contiguous on both sides are
+ *    merged back, so one RTL run covers as much as possible.
+ *  - Every page involved must be in RAM. A page that is swapped out makes
+ *    the instruction fail (swap-in is not done here).
+ *  - The frames of every queued copy are PINNED until the DMA completes, so
+ *    the page replacement code must not evict a frame for which
+ *    dma_frame_pinned() is true.
+ * ------------------------------------------------------------------------ */
+#ifdef MM64
+#define DMA_PAGESZ ((addr_t)PAGING64_PAGESZ)
+#else
+#define DMA_PAGESZ ((addr_t)PAGING_PAGESZ)
+#endif
+
+/* A 13-bit frame number addresses at most 8192 frames (32 MiB of 4 KiB frames) */
+#define DMA_MAX_FRAMES 8192
+/* More than the RAM can hold, so such a copy could not be fully resident */
+#define DMA_MAX_COPY ((addr_t)32 << 20)
+
+struct dma_run {
+  addr_t src;                   /* physical */
+  addr_t dst;                   /* physical */
+  addr_t len;
+};
+
+struct dma_ctx {                /* frames pinned by one queued run */
+  addr_t sfirst, slast;
+  addr_t dfirst, dlast;
+};
+
+static unsigned dma_pin_count[DMA_MAX_FRAMES];
+static pthread_mutex_t dma_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void dma_pin_range(addr_t first, addr_t last, int delta)
+{
+  addr_t f;
+
+  pthread_mutex_lock(&dma_pin_lock);
+  for (f = first; f <= last && f < DMA_MAX_FRAMES; f++)
+  {
+    if (delta > 0)
+      dma_pin_count[f]++;
+    else if (dma_pin_count[f] > 0)
+      dma_pin_count[f]--;
+  }
+  pthread_mutex_unlock(&dma_pin_lock);
+}
+
+/* Is frame fpn in use by a queued or running DMA copy? (for page replacement) */
+int dma_frame_pinned(uint64_t fpn)
+{
+  int pinned = 0;
+
+  if (fpn < DMA_MAX_FRAMES)
+  {
+    pthread_mutex_lock(&dma_pin_lock);
+    pinned = dma_pin_count[fpn] > 0;
+    pthread_mutex_unlock(&dma_pin_lock);
+  }
+  return pinned;
+}
+
+static void dma_run_frames(const struct dma_run *r, struct dma_ctx *c)
+{
+  c->sfirst = r->src / DMA_PAGESZ;
+  c->slast = (r->src + r->len - 1) / DMA_PAGESZ;
+  c->dfirst = r->dst / DMA_PAGESZ;
+  c->dlast = (r->dst + r->len - 1) / DMA_PAGESZ;
+}
+
+static void dma_pin_run(const struct dma_run *r, int delta)
+{
+  struct dma_ctx c;
+
+  dma_run_frames(r, &c);
+  dma_pin_range(c.sfirst, c.slast, delta);
+  dma_pin_range(c.dfirst, c.dlast, delta);
+}
+
+/* Runs on the DMA worker once a queued run has been executed */
+static void dma_unpin_cb(void *ctx, int status)
+{
+  struct dma_ctx *c = (struct dma_ctx *)ctx;
+
+  (void)status;
+  dma_pin_range(c->sfirst, c->slast, -1);
+  dma_pin_range(c->dfirst, c->dlast, -1);
+  free(c);
+}
+
+/*
+ * Page table lookup used to translate addresses: returns the PTE of page
+ * pgn of the caller. It is a hook because pte_get_entry() is still a stub in
+ * mm64.c (it returns the address of a local variable). Build with
+ * -DDMA_REAL_PTE once mm64.c really walks the page table; until then every
+ * lookup fails and dma_memcpy is refused instead of copying garbage.
+ */
+static int dma_pte_default(struct pcb_t *caller, addr_t pgn, addr_t *pte)
+{
+#ifdef DMA_REAL_PTE
+  *pte = pte_get_entry(caller->mm, pgn, caller);
+  return 0;
+#else
+  (void)caller;
+  (void)pgn;
+  (void)pte;
+  return -1;
+#endif
+}
+
+static int (*dma_pte_lookup)(struct pcb_t *, addr_t, addr_t *) = dma_pte_default;
+
+/* Replace the page table lookup (used by tests); NULL restores the default */
+void dma_set_pte_lookup(int (*fn)(struct pcb_t *, addr_t, addr_t *))
+{
+  dma_pte_lookup = (fn != NULL) ? fn : dma_pte_default;
+}
+
+/* Virtual address of the caller -> physical offset in RAM. mmvm_lock held. */
+static int dma_vtop(struct pcb_t *caller, addr_t va, addr_t *pa)
+{
+  addr_t pgn = va / DMA_PAGESZ;
+  addr_t pte = 0;
+  addr_t fpn;
+  addr_t nframes;
+
+  if (dma_pte_lookup(caller, pgn, &pte) != 0)
+  {
+    printf("libmem_dma_memcpy: page table lookup is not available\n");
+    return -1;
+  }
+  if (!PAGING_PAGE_PRESENT(pte) || (pte & PAGING_PTE_SWAPPED_MASK))
+  {
+    printf("libmem_dma_memcpy: page %llu is not in RAM\n", (unsigned long long)pgn);
+    return -1;
+  }
+
+  fpn = GETVAL(pte, PAGING_PTE_FPN_MASK, PAGING_PTE_FPN_LOBIT);
+  nframes = (addr_t)(caller->krnl->mram->maxsz / (int)DMA_PAGESZ);
+  if (fpn >= nframes || fpn >= DMA_MAX_FRAMES)
+  {
+    printf("libmem_dma_memcpy: frame %llu of page %llu is outside the RAM\n",
+           (unsigned long long)fpn, (unsigned long long)pgn);
+    return -1;
+  }
+
+  *pa = fpn * DMA_PAGESZ + va % DMA_PAGESZ;
+  return 0;
+}
+
+/* Append run r to the list and pin its frames */
+static void dma_add_run(struct dma_run *runs, int *nruns, const struct dma_run *r)
+{
+  runs[*nruns] = *r;
+  (*nruns)++;
+  dma_pin_run(r, +1);
+}
+
+/*
+ * Build the list of physical runs for the copy. On failure nothing stays
+ * pinned. mmvm_lock must be held (page tables and symrgtbl are protected by it).
+ */
+static int dma_build_runs(struct pcb_t *caller, uint32_t src, uint32_t dst,
+                          addr_t offset, addr_t size, struct dma_run *runs, int *nruns)
+{
+  struct vm_rg_struct *srg = &caller->mm->symrgtbl[src];
+  struct vm_rg_struct *drg = &caller->mm->symrgtbl[dst];
+  struct dma_run cur = {0, 0, 0};
+  int have = 0;
+  addr_t slen, dlen, sva, dva, left;
+  int i;
+
+  *nruns = 0;
+
+  if (srg->rg_end <= srg->rg_start || drg->rg_end <= drg->rg_start)
+  {
+    printf("libmem_dma_memcpy: region %u or %u is not allocated\n", src, dst);
+    return -1;
+  }
+  slen = srg->rg_end - srg->rg_start;
+  dlen = drg->rg_end - drg->rg_start;
+  if (offset > slen || size > slen - offset || offset > dlen || size > dlen - offset)
+  {
+    printf("libmem_dma_memcpy: offset %llu + size %llu does not fit in the regions\n",
+           (unsigned long long)offset, (unsigned long long)size);
+    return -1;
+  }
+
+  sva = srg->rg_start + offset;
+  dva = drg->rg_start + offset;
+  left = size;
+
+  while (left > 0)
+  {
+    addr_t spa, dpa;
+    addr_t seg = left;
+    addr_t sroom = DMA_PAGESZ - sva % DMA_PAGESZ;
+    addr_t droom = DMA_PAGESZ - dva % DMA_PAGESZ;
+
+    if (seg > sroom)
+      seg = sroom;
+    if (seg > droom)
+      seg = droom;
+
+    if (dma_vtop(caller, sva, &spa) != 0 || dma_vtop(caller, dva, &dpa) != 0)
+      goto fail;
+
+    if (have && cur.src + cur.len == spa && cur.dst + cur.len == dpa)
+    {
+      cur.len += seg;                 /* contiguous on both sides: extend */
+    }
+    else
+    {
+      if (have)
+        dma_add_run(runs, nruns, &cur);
+      cur.src = spa;
+      cur.dst = dpa;
+      cur.len = seg;
+      have = 1;
+    }
+
+    sva += seg;
+    dva += seg;
+    left -= seg;
+  }
+  if (have)
+    dma_add_run(runs, nruns, &cur);
+
+  return 0;
+
+fail:
+  for (i = 0; i < *nruns; i++)
+    dma_pin_run(&runs[i], -1);
+  *nruns = 0;
+  return -1;
+}
+
 /*libmem_dma_memcpy - DMA memcpy
  *@caller: caller
  *@src: source region
  *@dst: destination region
  *@offset: memory offset
  *@size: copied data size
+ *
+ * Returns 0 once the copy is QUEUED (the data is not there yet), -1 if it
+ * was refused: nothing is queued and nothing stays pinned.
  */
 int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t offset, uint32_t size)
 {
-  /* TODO: provide DMA mempy */
+  struct dma_run *runs;
+  int nruns = 0;
+  int i, rc;
+  addr_t maxruns;
 
-  //struct krnl_t *krnl = caller->krnl;
+  if (size == 0)
+    return 0;
 
-  /*
-   *  TODO: provide asynchronous dma memcpy
-   *        handling the dma_done_callback
-   */
-  //do_dma(caller, (uint64_t) src, (uint64_t) dst, (uint64_t) size);
-  //krnl->...
-  //krnl->...
-  if (caller == NULL || caller->krnl == NULL)
+  if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
+      caller->krnl->mram == NULL)
     return -1;
 
-  struct krnl_t *krnl = caller->krnl;
-  struct mm_struct *src_mm = caller->mm;
-  struct vm_rg_struct *src_rg = get_symrg_byid(caller->mm, src);
-  if ((src_rg == NULL || (src_rg->rg_start == 0 && src_rg->rg_end == 0)) && krnl->mm != NULL)
+  /* get_symrg_byid() lets rgid == PAGING_MAX_SYMTBL_SZ through, so check here */
+  if (src >= PAGING_MAX_SYMTBL_SZ || dst >= PAGING_MAX_SYMTBL_SZ)
   {
-    struct vm_rg_struct *krg = get_symrg_byid(krnl->mm, src);
-    if (krg != NULL && krg->rg_end > krg->rg_start)
+    printf("libmem_dma_memcpy: invalid region id %u or %u\n", src, dst);
+    return -1;
+  }
+  if (size > DMA_MAX_COPY)
+  {
+    printf("libmem_dma_memcpy: %u bytes is more than the RAM can hold\n", size);
+    return -1;
+  }
+
+  /* cuts happen at the page boundaries of the source AND of the destination */
+  maxruns = (addr_t)size / DMA_PAGESZ * 2 + 3;
+  runs = (struct dma_run *)calloc(maxruns, sizeof(struct dma_run));
+  if (runs == NULL)
+    return -1;
+
+  pthread_mutex_lock(&mmvm_lock);
+  rc = dma_build_runs(caller, src, dst, offset, size, runs, &nruns);
+  if (rc == 0 && src == dst)
+  {
+    /* same region, same offset: nothing to move */
+    for (i = 0; i < nruns; i++)
+      dma_pin_run(&runs[i], -1);
+    nruns = 0;
+  }
+  pthread_mutex_unlock(&mmvm_lock);
+
+  if (rc != 0)
+  {
+    free(runs);
+    return -1;
+  }
+
+  for (i = 0; i < nruns; i++)
+  {
+    struct dma_ctx *ctx = (struct dma_ctx *)malloc(sizeof(struct dma_ctx));
+    int j;
+
+    if (ctx != NULL)
     {
-      src_mm = krnl->mm;
-      src_rg = krg;
+      dma_run_frames(&runs[i], ctx);
+      if (dma_submit(caller->pid, runs[i].src, runs[i].dst, runs[i].len,
+                     dma_unpin_cb, ctx) == 0)
+        continue;
+      free(ctx);
     }
-  }
 
-  struct mm_struct *dst_mm = caller->mm;
-  struct vm_rg_struct *dst_rg = get_symrg_byid(caller->mm, dst);
-  if ((dst_rg == NULL || (dst_rg->rg_start == 0 && dst_rg->rg_end == 0)) && krnl->mm != NULL)
-  {
-    struct vm_rg_struct *krg = get_symrg_byid(krnl->mm, dst);
-    if (krg != NULL && krg->rg_end > krg->rg_start)
-    {
-      dst_mm = krnl->mm;
-      dst_rg = krg;
-    }
-  }
-
-  if (src_rg == NULL || dst_rg == NULL)
+    /* could not queue run i: release the pins of the runs not queued */
+    printf("libmem_dma_memcpy: cannot queue the copy\n");
+    for (j = i; j < nruns; j++)
+      dma_pin_run(&runs[j], -1);
+    free(runs);
     return -1;
-
-  addr_t src_vaddr = src_rg->rg_start + offset;
-  addr_t dst_vaddr = dst_rg->rg_start + offset;
-  int src_fpn = 0, dst_fpn = 0;
-
-#ifdef MM64
-  int src_pgn = src_vaddr >> PAGING64_ADDR_PT_SHIFT;
-  int src_off = src_vaddr & (PAGING64_PAGESZ - 1);
-  int dst_pgn = dst_vaddr >> PAGING64_ADDR_PT_SHIFT;
-  int dst_off = dst_vaddr & (PAGING64_PAGESZ - 1);
-#else
-  int src_pgn = PAGING_PGN(src_vaddr);
-  int src_off = PAGING_OFFST(src_vaddr);
-  int dst_pgn = PAGING_PGN(dst_vaddr);
-  int dst_off = PAGING_OFFST(dst_vaddr);
-#endif
-
-  if (pg_getpage(src_mm, src_pgn, &src_fpn, caller) != 0)
-    return -1;
-  if (pg_getpage(dst_mm, dst_pgn, &dst_fpn, caller) != 0)
-    return -1;
-
-#ifdef MM64
-  uint64_t src_phyaddr = ((uint64_t)src_fpn << PAGING64_ADDR_PT_SHIFT) + src_off;
-  uint64_t dst_phyaddr = ((uint64_t)dst_fpn << PAGING64_ADDR_PT_SHIFT) + dst_off;
-#else
-  uint64_t src_phyaddr = ((uint64_t)src_fpn << PAGING_ADDR_FPN_LOBIT) + src_off;
-  uint64_t dst_phyaddr = ((uint64_t)dst_fpn << PAGING_ADDR_FPN_LOBIT) + dst_off;
-#endif
-
-  for (uint32_t i = 0; i < size; i++)
-  {
-    BYTE data = 0;
-    if (src_mm == krnl->mm)
-      __read_kernel_mem(caller, 0, src, offset + i, &data);
-    else
-      __read_user_mem(caller, 0, src, offset + i, &data);
-
-    if (dst_mm == krnl->mm)
-      __write_kernel_mem(caller, 0, dst, offset + i, data);
-    else
-      __write_user_mem(caller, 0, dst, offset + i, data);
   }
 
-  if (!memory_bank_is_available())
-  {
-    size_t bank_sz = (krnl->mram != NULL && krnl->mram->maxsz > 0) ? (size_t)krnl->mram->maxsz : (1024 * 1024);
-    memory_bank_init(bank_sz);
-  }
-
-  do_dma(caller, src_phyaddr, dst_phyaddr, (uint64_t)size);
-
+  free(runs);
   return 0;
 }
 

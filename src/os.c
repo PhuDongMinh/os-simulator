@@ -16,6 +16,7 @@
 #ifdef MM64
 #include "mm64.h"
 #endif
+#include "dma.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -25,8 +26,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* The co-processor (DMA/Verilator) is not part of the loader-CPU flow yet.
- * Compile with -DUSE_DMA to enable it. */
+/* The DMA (Verilator RTL + system bus) is built in with -DUSE_DMA */
 #ifdef USE_DMA
 #include "sysbus.h"
 #include "dpi_rtl.h"
@@ -69,13 +69,255 @@ struct cpu_args {
 	int id;
 };
 
+/* ------------------------------------------------------------------------
+ * DMA service: a queue of copy requests and ONE worker thread that drives
+ * the RTL simulation. A CPU only queues a request (dma_submit) and goes on
+ * with its next instruction.
+ *
+ * The worker is not a timer device: the RTL has its own clock and runs at
+ * its own pace, so the simulated slots do not wait for it. The only place
+ * where a CPU waits for the DMA is when a process ends
+ * (dma_process_exit), so that its frames are not reused while the RTL is
+ * still writing them.
+ * ------------------------------------------------------------------------ */
+#ifdef USE_DMA
+
+struct dma_req {
+	uint32_t pid;
+	uint64_t src;
+	uint64_t dst;
+	uint64_t len;
+	dma_done_fn done;
+	void *ctx;
+	struct dma_req *next;
+};
+
+/* Per process bookkeeping */
+struct dma_acct {
+	uint32_t pid;
+	int pending;                /* queued or running */
+	int failed;                 /* finished with an error */
+	struct dma_acct *next;
+};
+
+static pthread_mutex_t dma_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dma_work = PTHREAD_COND_INITIALIZER;     /* worker: a request or stop */
+static pthread_cond_t dma_finished = PTHREAD_COND_INITIALIZER; /* waiters: a request completed */
+static struct dma_req *dma_head = NULL;
+static struct dma_req *dma_tail = NULL;
+static struct dma_acct *dma_accts = NULL;
+static int dma_running = 0;
+static int dma_stop = 0;
+static pthread_t dma_thread;
+
+/* dma_lock must be held */
+static struct dma_acct *dma_acct_find(uint32_t pid, int create)
+{
+	struct dma_acct *a;
+
+	for (a = dma_accts; a != NULL; a = a->next)
+		if (a->pid == pid)
+			return a;
+	if (!create)
+		return NULL;
+	a = (struct dma_acct *)calloc(1, sizeof(struct dma_acct));
+	if (a == NULL)
+		return NULL;
+	a->pid = pid;
+	a->next = dma_accts;
+	dma_accts = a;
+	return a;
+}
+
+int dma_submit(uint32_t pid, uint64_t source, uint64_t destination, uint64_t length,
+	       dma_done_fn done, void *ctx)
+{
+	struct dma_req *req = (struct dma_req *)calloc(1, sizeof(struct dma_req));
+	struct dma_acct *acct;
+
+	if (req == NULL)
+		return -1;
+	req->pid = pid;
+	req->src = source;
+	req->dst = destination;
+	req->len = length;
+	req->done = done;
+	req->ctx = ctx;
+
+	pthread_mutex_lock(&dma_lock);
+	acct = (dma_running && !dma_stop) ? dma_acct_find(pid, 1) : NULL;
+	if (acct == NULL) {
+		pthread_mutex_unlock(&dma_lock);
+		free(req);
+		return -1;
+	}
+	acct->pending++;
+	if (dma_tail != NULL)
+		dma_tail->next = req;
+	else
+		dma_head = req;
+	dma_tail = req;
+	pthread_cond_signal(&dma_work);
+	pthread_mutex_unlock(&dma_lock);
+	return 0;
+}
+
+int dma_pending_for(uint32_t pid)
+{
+	struct dma_acct *a;
+	int n = 0;
+
+	pthread_mutex_lock(&dma_lock);
+	a = dma_acct_find(pid, 0);
+	if (a != NULL)
+		n = a->pending;
+	pthread_mutex_unlock(&dma_lock);
+	return n;
+}
+
+int dma_process_exit(uint32_t pid)
+{
+	struct dma_acct *a;
+	int failed = 0;
+
+	pthread_mutex_lock(&dma_lock);
+	a = dma_acct_find(pid, 0);
+	if (a != NULL) {
+		struct dma_acct **pp;
+
+		while (a->pending > 0)
+			pthread_cond_wait(&dma_finished, &dma_lock);
+		failed = a->failed;
+		for (pp = &dma_accts; *pp != a; pp = &(*pp)->next)
+			;
+		*pp = a->next;
+		free(a);
+	}
+	pthread_mutex_unlock(&dma_lock);
+	return failed;
+}
+
+/* The only thread that touches the RTL simulation */
+static void *dma_worker(void *arg)
+{
+	(void)arg;
+
+	while (1) {
+		struct dma_req *req;
+		struct dma_acct *a;
+		int rc;
+
+		pthread_mutex_lock(&dma_lock);
+		while (dma_head == NULL && !dma_stop)
+			pthread_cond_wait(&dma_work, &dma_lock);
+		if (dma_head == NULL) {
+			/* stop requested and nothing left to do */
+			pthread_mutex_unlock(&dma_lock);
+			break;
+		}
+		req = dma_head;
+		dma_head = req->next;
+		if (dma_head == NULL)
+			dma_tail = NULL;
+		pthread_mutex_unlock(&dma_lock);
+
+		rc = do_dma(NULL, req->src, req->dst, req->len);
+		if (req->done != NULL)
+			req->done(req->ctx, rc);
+
+		pthread_mutex_lock(&dma_lock);
+		a = dma_acct_find(req->pid, 0);
+		if (a != NULL) {
+			a->pending--;
+			if (rc != 0)
+				a->failed++;
+		}
+		pthread_cond_broadcast(&dma_finished);
+		pthread_mutex_unlock(&dma_lock);
+		free(req);
+	}
+	return NULL;
+}
+
+/* Initialise the RTL simulation, then start the worker */
+static int dma_service_start(void)
+{
+	if (rtl_dma_init_simulation() != 0) {
+		printf("Cannot initialize RTL simulation\n");
+		return -1;
+	}
+	pthread_mutex_lock(&dma_lock);
+	dma_stop = 0;
+	dma_running = 1;
+	pthread_mutex_unlock(&dma_lock);
+	if (pthread_create(&dma_thread, NULL, dma_worker, NULL) != 0) {
+		printf("Cannot start the DMA worker\n");
+		pthread_mutex_lock(&dma_lock);
+		dma_running = 0;
+		pthread_mutex_unlock(&dma_lock);
+		rtl_dma_cleanup_simulation();
+		return -1;
+	}
+	return 0;
+}
+
+/* Let the worker finish what is queued, join it, release the RTL */
+static void dma_service_stop(void)
+{
+	struct dma_acct *a;
+
+	if (!dma_running)
+		return;
+	pthread_mutex_lock(&dma_lock);
+	dma_stop = 1;
+	pthread_cond_broadcast(&dma_work);
+	pthread_mutex_unlock(&dma_lock);
+	pthread_join(dma_thread, NULL);
+
+	pthread_mutex_lock(&dma_lock);
+	dma_running = 0;
+	while (dma_accts != NULL) {
+		a = dma_accts;
+		dma_accts = a->next;
+		free(a);
+	}
+	pthread_mutex_unlock(&dma_lock);
+	rtl_dma_cleanup_simulation();
+}
+
+#else /* !USE_DMA: no DMA, requests are refused */
+
+int dma_submit(uint32_t pid, uint64_t source, uint64_t destination, uint64_t length,
+	       dma_done_fn done, void *ctx)
+{
+	(void)pid; (void)source; (void)destination; (void)length;
+	(void)done; (void)ctx;
+	return -1;
+}
+
+int dma_pending_for(uint32_t pid)
+{
+	(void)pid;
+	return 0;
+}
+
+int dma_process_exit(uint32_t pid)
+{
+	(void)pid;
+	return 0;
+}
+
+static void dma_service_stop(void)
+{
+}
+
+#endif /* USE_DMA */
+
 /*
  * CPU thread. Rules for the timer:
  *  - every slot, this thread must call next_slot() exactly once
  *  - when it exits, it must call detach_event()
  */
-
- //lấy proc mới
 static void *cpu_routine(void *args)
 {
 	struct timer_id_t *timer_id = ((struct cpu_args *)args)->timer_id;
@@ -87,9 +329,21 @@ static void *cpu_routine(void *args)
 		/* 1. Handle the current process, if any */
 		if (proc != NULL) {
 			if (proc->pc == proc->code->size) {
-				/* The process has finished its job */
+				/* Last instruction done. The process may still have DMA
+				 * requests in flight: wait for them, so that its memory is
+				 * not released while the RTL is writing it. */
+				int dma_failed = dma_process_exit(proc->pid);
+
+				if (dma_failed > 0)
+					printf("\tCPU %d: PID %2d: %d DMA request(s) failed\n",
+					       id, proc->pid, dma_failed);
 				printf("\tCPU %d: Processed %2d has finished\n",
 				       id, proc->pid);
+				/* TODO(cleanup): the memory of the process (frames, regions,
+				 * mm) should be released here, before the PCB, once
+				 * free_pcb_memph() is fixed. It must also be removed from
+				 * krnl->running_list under the scheduler's lock, which needs
+				 * a function from sched.c. */
 				free(proc->code->text);
 				free(proc->code);
 				free(proc->page_table); /* legacy field, may be NULL */
@@ -126,8 +380,11 @@ static void *cpu_routine(void *args)
 			time_left = time_slot;
 		}
 
-		/* 3. Run one instruction in this slot */
-		run(proc);
+		/* 3. Run one instruction in this slot. A failing instruction is
+		 * reported and the process goes on with the next one. */
+		if (proc->pc < proc->code->size && run(proc) != 0)
+			printf("\tCPU %d: PID %2d: instruction at pc=%u failed\n",
+			       id, proc->pid, proc->pc - 1);
 		time_left--;
 		next_slot(timer_id);
 	}
@@ -135,27 +392,13 @@ static void *cpu_routine(void *args)
 	pthread_exit(NULL);
 }
 
-#ifdef USE_DMA
-static void *co_processor(void *arg)
-{
-	(void)arg;
-	/* TODO: Initialize the internal Verilator RTL simulation. */
-	if (rtl_dma_init_simulation() != 0) {
-		printf("Cannot initialize RTL simulation\n");
-		return (void *)1;
-	}
-	/* TODO: asynchronous DMA handling (callback/IRQ) */
-	return NULL;
-}
-#endif
-
-//khởi tạo OS (kernel)
 static void *ld_routine(void *args)
 {
 #ifdef MM_PAGING
 	struct memphy_struct *mram = ((struct mmpaging_ld_args *)args)->mram;
 	struct memphy_struct **mswp = ((struct mmpaging_ld_args *)args)->mswp;
 	struct memphy_struct *active_mswp = ((struct mmpaging_ld_args *)args)->active_mswp;
+	int active_mswp_id = ((struct mmpaging_ld_args *)args)->active_mswp_id;
 	struct timer_id_t *timer_id = ((struct mmpaging_ld_args *)args)->timer_id;
 #else
 	struct timer_id_t *timer_id = (struct timer_id_t *)args;
@@ -176,6 +419,7 @@ static void *ld_routine(void *args)
 	os.mram = mram;
 	os.mswp = mswp;
 	os.active_mswp = active_mswp;
+	os.active_mswp_id = active_mswp_id;
 	os.mm = (struct mm_struct *)calloc(1, sizeof(struct mm_struct));
 	init_mm(os.mm, NULL);
 #endif
@@ -226,7 +470,6 @@ static void *ld_routine(void *args)
 	pthread_exit(NULL);
 }
 
-//đọc file config để khởi tạo cấu hình
 static void read_config(const char *path)
 {
 	FILE *file;
@@ -308,9 +551,6 @@ int main(int argc, char *argv[])
 	struct cpu_args *args =
 		(struct cpu_args *)malloc(sizeof(struct cpu_args) * num_cpus);
 	pthread_t ld;
-#ifdef USE_DMA
-	pthread_t dma;
-#endif
 
 	/* Init timer: one event per thread (each CPU + loader) */
 	for (i = 0; i < num_cpus; i++) {
@@ -321,26 +561,45 @@ int main(int argc, char *argv[])
 	start_timer();
 
 #ifdef MM_PAGING
-	/* Init all MEMPHY: 1 MEMRAM and n MEMSWP */
+	/* Init all MEMPHY: 1 MEMRAM and n of MEMSWP. Zero them first: a swap
+	 * device of size 0 is not formatted and must not hold garbage lists. */
 	int rdmflag = 1; /* random access memory */
 
 	struct memphy_struct mram;
 	struct memphy_struct mswp[PAGING_MAX_MMSWP];
+	/* krnl_t.mswp is an array of POINTERS to the devices */
+	struct memphy_struct *mswp_ptr[PAGING_MAX_MMSWP];
+
+	memset(&mram, 0, sizeof(mram));
+	memset(mswp, 0, sizeof(mswp));
 
 	init_memphy(&mram, memramsz, rdmflag);
 
 	int sit;
-	for (sit = 0; sit < PAGING_MAX_MMSWP; sit++)
+	for (sit = 0; sit < PAGING_MAX_MMSWP; sit++) {
 		init_memphy(&mswp[sit], memswpsz[sit], rdmflag);
+		mswp_ptr[sit] = &mswp[sit];
+	}
+
+#ifdef USE_DMA
+	/* The DMA reads and writes the OS RAM directly through the system bus */
+	if (mram.maxsz <= 0 ||
+	    memory_bank_attach(mram.storage, (size_t)mram.maxsz) == MEMORY_BANK_INVALID) {
+		printf("Cannot attach the RAM (%lu bytes) to the DMA bus\n", memramsz);
+		return 1;
+	}
+	if (dma_service_start() != 0)
+		return 1;
+#endif
 
 	/* In paging mode, system memory is passed to each PCB via the loader */
 	struct mmpaging_ld_args *mm_ld_args =
 		(struct mmpaging_ld_args *)calloc(1, sizeof(struct mmpaging_ld_args));
 
 	mm_ld_args->timer_id = ld_event;
-	mm_ld_args->mram = (struct memphy_struct *)&mram;
-	mm_ld_args->mswp = (struct memphy_struct **)&mswp;
-	mm_ld_args->active_mswp = (struct memphy_struct *)&mswp[0];
+	mm_ld_args->mram = &mram;
+	mm_ld_args->mswp = mswp_ptr;
+	mm_ld_args->active_mswp = &mswp[0];
 	mm_ld_args->active_mswp_id = 0;
 #endif
 
@@ -357,18 +616,17 @@ int main(int argc, char *argv[])
 		pthread_create(&cpu[i], NULL, cpu_routine, (void *)&args[i]);
 	}
 
-#ifdef USE_DMA
-	/* Run co-processor */
-	pthread_create(&dma, NULL, co_processor, NULL);
-#endif
-
 	/* Wait for CPUs and loader to finish */
 	for (i = 0; i < num_cpus; i++) {
 		pthread_join(cpu[i], NULL);
 	}
 	pthread_join(ld, NULL);
+
+	/* Every process has ended, and a process only ends after its DMA
+	 * requests completed, so the DMA has nothing left to do. */
+	dma_service_stop();
 #ifdef USE_DMA
-	pthread_join(dma, NULL);
+	memory_bank_cleanup();
 #endif
 
 	/* Stop timer */
@@ -377,6 +635,10 @@ int main(int argc, char *argv[])
 	free(cpu);
 	free(args);
 #ifdef MM_PAGING
+	/* RAM and swap contents: every thread is done with them */
+	free(mram.storage);
+	for (sit = 0; sit < PAGING_MAX_MMSWP; sit++)
+		free(mswp[sit].storage);
 	free(mm_ld_args);
 #endif
 	return 0;
