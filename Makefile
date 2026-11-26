@@ -5,7 +5,8 @@
 # personal permission to use and modify the Licensed Source Code
 # for the sole purpose of studying while attending the course CO2018.
 #
-INC = -Iinclude
+# Project headers use quotes; keep system <sched.h> distinct from include/sched.h.
+INC = -iquote include
 LIB = -lpthread
 
 SRC = src

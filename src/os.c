@@ -181,9 +181,18 @@ static void *ld_routine(void *args)
 	int i = 0;
 
 #ifdef MM_PAGING
-	/* init kernel page table directory (calloc: no garbage PTE) */
+	os.mram = mram;
+	os.mswp = mswp;
+	os.active_mswp = active_mswp;
+	/* Shared kernel address space: init_mm(.., NULL) creates its root. */
+	os.mm = (struct mm_struct *)calloc(1, sizeof(struct mm_struct));
+	if (os.mm == NULL || init_mm(os.mm, NULL) != 0) {
+		printf("Cannot initialize kernel address space\n");
+		exit(1);
+	}
 #ifdef MM64
-	os.krnl_pgd = (addr_t *)calloc(PAGING64_MAX_PGN, sizeof(addr_t));
+	/* Borrowed alias of the kernel root: never allocated/freed separately */
+	os.krnl_pgd = os.mm->pgd;
 	os.krnl_p4d = NULL;
 	os.krnl_pud = NULL;
 	os.krnl_pmd = NULL;
@@ -191,11 +200,6 @@ static void *ld_routine(void *args)
 #else
 	os.krnl_pgd = (uint32_t *)calloc(PAGING_MAX_PGN, sizeof(uint32_t));
 #endif
-	os.mram = mram;
-	os.mswp = mswp;
-	os.active_mswp = active_mswp;
-	os.mm = (struct mm_struct *)calloc(1, sizeof(struct mm_struct));
-	init_mm(os.mm, NULL);
 #endif
 	printf("ld_routine\n");
 
@@ -233,7 +237,11 @@ static void *ld_routine(void *args)
 		}
 #ifdef MM_PAGING
 		proc->mm = (struct mm_struct *)calloc(1, sizeof(struct mm_struct));
-		init_mm(proc->mm, proc);
+		if (proc->mm == NULL || init_mm(proc->mm, proc) != 0) {
+			printf("Cannot initialize address space of %s\n",
+			       ld_processes.path[i]);
+			exit(1);
+		}
 #endif
 #ifdef MLQ_SCHED
 		printf("\tLoaded a process at %s, PID: %d PRIO: %lu\n",
@@ -357,12 +365,36 @@ int main(int argc, char *argv[])
 
 	struct memphy_struct mram;
 	struct memphy_struct mswp[PAGING_MAX_MMSWP];
-
-	init_memphy(&mram, memramsz, rdmflag);
-
 	int sit;
+
+#ifdef MM64
+	/* A PTE can only address PAGING64_MAX_RAMSZ of RAM (16-bit FPN) and
+	 * PAGING64_MAX_SWPSZ per swap device: larger devices are clamped. */
+	if (memramsz > PAGING64_MAX_RAMSZ) {
+		printf("RAM size %lu exceeds the %llu bytes a PTE can address, "
+		       "clamped\n", memramsz, PAGING64_MAX_RAMSZ);
+		memramsz = PAGING64_MAX_RAMSZ;
+	}
+	for (sit = 0; sit < PAGING_MAX_MMSWP; sit++) {
+		if (memswpsz[sit] > PAGING64_MAX_SWPSZ) {
+			printf("SWAP%d size %lu exceeds %llu bytes, clamped\n",
+			       sit, memswpsz[sit], PAGING64_MAX_SWPSZ);
+			memswpsz[sit] = PAGING64_MAX_SWPSZ;
+		}
+	}
+#endif
+
+	if (init_memphy(&mram, memramsz, rdmflag) != 0) {
+		printf("Cannot initialize RAM of %lu bytes\n", memramsz);
+		exit(1);
+	}
+
 	for (sit = 0; sit < PAGING_MAX_MMSWP; sit++)
-		init_memphy(&mswp[sit], memswpsz[sit], rdmflag);
+		if (init_memphy(&mswp[sit], memswpsz[sit], rdmflag) != 0) {
+			printf("Cannot initialize SWAP%d of %lu bytes\n",
+			       sit, memswpsz[sit]);
+			exit(1);
+		}
 
 	/* In paging mode, system memory is passed to each PCB via the loader */
 	struct mmpaging_ld_args *mm_ld_args =

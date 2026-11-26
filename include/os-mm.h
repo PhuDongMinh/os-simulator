@@ -11,6 +11,9 @@
 #ifndef OSMM_H
 #define OSMM_H
 
+/* Configuration must precede every MM64-dependent type, even when this
+ * header is the translation unit's first project include. */
+#include "os-cfg.h"
 #include <stdint.h>
 
 #define MM_PAGING
@@ -30,7 +33,18 @@
 
 typedef char BYTE;
 typedef ADDR_TYPE addr_t;
+/* Leaf encoding is always 32 bits; addresses and child pointers are not PTEs. */
+typedef uint32_t mm_pte_t;
 //typedef unsigned int uint32_t;
+
+#ifdef MM64
+/* Host-heap table nodes. Definitions are private to the MM64 implementation. */
+struct pt_pgd;
+struct pt_p4d;
+struct pt_pud;
+struct pt_pmd;
+struct pt_leaf;
+#endif
 
 /* 
  * @bksysnet: the format string need to be redefined
@@ -100,7 +114,10 @@ struct kcache_pool_struct {
  */
 struct mm_struct {
 #ifdef MM64
-   addr_t *pgd;
+   /* Sole owning root: private per process, shared through kernel mm only. */
+   struct pt_pgd *pgd;
+   /* Compatibility placeholders, not roots or current-table caches.
+    * Future MM64 initialization must leave these NULL. */
    addr_t *p4d;
    addr_t *pud;
    addr_t *pmd;

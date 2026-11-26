@@ -8,6 +8,9 @@
  * for the sole purpose of studying while attending the course CO2018.
  */
 
+#ifndef SYSCALL_H
+#define SYSCALL_H
+
 #include "common.h"
 
 
@@ -32,6 +35,10 @@ struct sc_regs {
 
 
 /* This is used purely for kernel trace the table of system call */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern const char* sys_call_table[];
 extern const int syscall_table_size;
 
@@ -40,4 +47,10 @@ int __mm_swap_page(struct pcb_t *, addr_t , addr_t);
 int libsyscall(struct pcb_t*, uint32_t, arg_t, arg_t, arg_t);
 int _syscall(struct krnl_t*, uint32_t, uint32_t, struct sc_regs*);
 int __sys_ni_syscall(struct krnl_t*, struct sc_regs*);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SYSCALL_H */
 

@@ -3,13 +3,10 @@
 
 /* Define structs and routine could be used by every source files */
 
+#include "os-cfg.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <pthread.h>
-
-#ifndef OSCFG_H
-#include "os-cfg.h"
-#endif
 
 #ifndef OSMM_H
 #include "os-mm.h"
@@ -147,7 +144,10 @@ struct krnl_t
 	struct kcache_pool_struct *kcpooltbl;
 	
 #ifdef MM64
-	addr_t *krnl_pgd;
+	/* Borrowed alias of mm->pgd; never allocate/free a second kernel root.
+	 * Establish the alias during kernel initialization (after Stage B0). */
+	struct pt_pgd *krnl_pgd;
+	/* Legacy compatibility placeholders; keep NULL in MM64. */
 	addr_t *krnl_p4d;
 	addr_t *krnl_pud;
 	addr_t *krnl_pmd;

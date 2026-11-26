@@ -1,4 +1,5 @@
 #ifndef MM_H
+#define MM_H
 
 #include "common.h"
 #include "bitops.h"
@@ -23,19 +24,39 @@ extern "C" {
 #define PAGING_PTE_SWAPPED_MASK BIT(30)
 #define PAGING_PTE_RESERVE_MASK BIT(29)
 #define PAGING_PTE_DIRTY_MASK BIT(28)
+#ifndef MM64
 #define PAGING_PTE_EMPTY01_MASK BIT(14)
 #define PAGING_PTE_EMPTY02_MASK BIT(13)
+#endif
 
 /* PTE BIT PRESENT */
 #define PAGING_PTE_SET_PRESENT(pte) (pte=pte|PAGING_PTE_PRESENT_MASK)
 #define PAGING_PAGE_PRESENT(pte) (pte&PAGING_PTE_PRESENT_MASK)
 
+/*
+ * Present-page layout.
+ * Legacy 32-bit mode follows the spec figure: FPN 12..0, bits 14..13 zero,
+ * USRNUM 27..15.
+ * MM64: the FPN is widened into the spec's zero/"user-defined" bits to
+ * 16 bits (15..0) so 65536 frames x 4 KiB = 256 MiB of RAM are addressable.
+ * Bits 27..16 remain implementation-defined flag space (Module 1).
+ * The swapped-page layout (type 4..0, offset 25..5) is unchanged.
+ */
+#ifdef MM64
+/* USRNUM / flag space */
+#define PAGING_PTE_USRNUM_LOBIT 16
+#define PAGING_PTE_USRNUM_HIBIT 27
+/* FPN */
+#define PAGING_PTE_FPN_LOBIT 0
+#define PAGING_PTE_FPN_HIBIT 15
+#else
 /* USRNUM */
 #define PAGING_PTE_USRNUM_LOBIT 15
 #define PAGING_PTE_USRNUM_HIBIT 27
 /* FPN */
 #define PAGING_PTE_FPN_LOBIT 0
 #define PAGING_PTE_FPN_HIBIT 12
+#endif
 /* SWPTYP */
 #define PAGING_PTE_SWPTYP_LOBIT 0
 #define PAGING_PTE_SWPTYP_HIBIT 4
@@ -116,6 +137,7 @@ int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
                 struct memphy_struct *mpdst, addr_t dstfpn) ;
 /* KMEM prototypes */
 addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *alloc_addr);
+int __kfree(struct pcb_t *caller, int vmaid, int rgid);
 addr_t __kmem_cache_alloc(struct pcb_t *caller, int vmaid, int rgid, int cache_pool_id, addr_t *alloc_addr);
 
 /* VM region prototypes */
@@ -131,6 +153,9 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn,struct pcb_t *calle
 int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff);
 addr_t pte_get_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller);
 int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb_t *caller);
+/* Public signatures retain their existing address-sized value containers.
+ * Leaf storage is mm_pte_t; validation/conversion belongs to later PTE work. */
+int pte_clear_entry(struct mm_struct *mm, addr_t pgn, struct pcb_t *caller);
 int init_pte(addr_t *pte,
              int pre,    // present
              addr_t fpn,    // FPN
@@ -143,6 +168,7 @@ int __free(struct pcb_t *caller, int vmaid, int rgid);
 int __read(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data);
 int __write(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value);
 int init_mm(struct mm_struct *mm, struct pcb_t *caller);
+int free_pcb_memph(struct pcb_t *caller);
 
 /* VM prototypes */
 int pgalloc(struct pcb_t *proc, uint32_t size, uint32_t reg_index);
