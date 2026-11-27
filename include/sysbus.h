@@ -31,6 +31,14 @@ typedef int memory_bank_t;
 // Initialize a memory bank with given size in bytes
 memory_bank_t memory_bank_init(size_t size_bytes);
 
+/*
+ * Attach EXISTING memory (e.g. the OS RAM, os.mram->storage) as a bank.
+ * Nothing is allocated or copied, so the RTL reads/writes that memory
+ * directly. The bank is not owned: memory_bank_cleanup() will not free it.
+ * The RTL callbacks use bank 0, so attach before any memory_bank_init().
+ */
+memory_bank_t memory_bank_attach(void *base, size_t size_bytes);
+
 // Cleanup all memory banks
 void memory_bank_cleanup(void);
 
@@ -42,6 +50,27 @@ size_t memory_bank_get_size(void);
 
 // Check if memory bank is initialized
 int memory_bank_is_available(void);
+
+/*
+ * Return 1 if [offset, offset + length) lies completely inside bank 0,
+ * 0 otherwise (also when no bank exists). Overflow safe.
+ */
+int memory_bank_check_range(uint64_t offset, uint64_t length);
+
+/*
+ * Return how many invalid RTL accesses (out of range / negative offset)
+ * happened since the last call, and reset the counter. A non-zero value
+ * after a DMA copy means the copied data cannot be trusted.
+ */
+int memory_bank_take_bus_errors(void);
+
+/*
+ * Install a function called from dma_done_callback() each time the RTL
+ * reports that a transfer completed (NULL removes it). It runs inside the
+ * RTL evaluation, on the thread that is driving the RTL, so it must be
+ * short and must not block.
+ */
+void dma_set_done_hook(void (*hook)(void));
 
 // DPI Callback: Called from RTL when DMA read access
 int dpi_bank_read32_legacy(long long offset);
