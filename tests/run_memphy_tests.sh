@@ -22,7 +22,12 @@ fi
 # libmem defines __read/__write, names also referenced by sanitizer/libc.
 # Localize unrelated definitions so they cannot become dynamic link roots.
 objcopy --keep-global-symbol=MEMPHY_get_freefp_contig "$build_dir/libmem.o"
+# libmem's DMA translation calls pte_get_entry (mm64.c) through a function
+# pointer, which --gc-sections cannot drop: link the page table too.
+"$cc" $flags -iquote include -iquote src -Wall -pthread \
+    -c src/mm64.c -o "$build_dir/mm64.o"
 "$cc" $flags -pthread "$build_dir/test.o" "$build_dir/memphy.o" \
-    "$build_dir/libmem.o" -Wl,--gc-sections -Wl,--wrap=malloc -Wl,--wrap=free \
+    "$build_dir/libmem.o" "$build_dir/mm64.o" \
+    -Wl,--gc-sections -Wl,--wrap=malloc -Wl,--wrap=free \
     -o "$build_dir/test_memphy"
 "$build_dir/test_memphy"

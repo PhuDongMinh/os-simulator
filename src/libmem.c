@@ -862,10 +862,15 @@ int libkmem_free(struct pcb_t *caller, uint32_t reg_index)
 #define DMA_PAGESZ ((addr_t)PAGING_PAGESZ)
 #endif
 
-/* A 13-bit frame number addresses at most 8192 frames (32 MiB of 4 KiB frames) */
+/* Frames a PTE can address: MM64 has a 16-bit FPN (65536 frames = 256 MiB,
+ * os.c clamps the RAM to that); the 32-bit layout a 13-bit one (8192). */
+#ifdef MM64
+#define DMA_MAX_FRAMES ((addr_t)PAGING64_MAX_RAM_FRAMES)
+#else
 #define DMA_MAX_FRAMES 8192
+#endif
 /* More than the RAM can hold, so such a copy could not be fully resident */
-#define DMA_MAX_COPY ((addr_t)32 << 20)
+#define DMA_MAX_COPY (DMA_MAX_FRAMES * DMA_PAGESZ)
 
 struct dma_run {
   addr_t src;                   /* physical */
@@ -940,14 +945,20 @@ static void dma_unpin_cb(void *ctx, int status)
 
 /*
  * Page table lookup used to translate addresses: returns the PTE of page
- * pgn of the caller. It is a hook because pte_get_entry() is still a stub in
- * mm64.c (it returns the address of a local variable). Build with
- * -DDMA_REAL_PTE once mm64.c really walks the page table; until then every
- * lookup fails and dma_memcpy is refused instead of copying garbage.
+ * pgn of the caller. It is a hook so that tests can substitute it.
+ * MM64: pte_get_entry() walks the five-level tree (a missing path reads as
+ * 0, i.e. "not in RAM"). Safe under mmvm_lock (mmvm_lock -> pgd->lock).
+ * 32-bit layout: still needs -DDMA_REAL_PTE; without it every lookup fails
+ * and dma_memcpy is refused instead of copying garbage.
  */
 static int dma_pte_default(struct pcb_t *caller, addr_t pgn, addr_t *pte)
 {
-#ifdef DMA_REAL_PTE
+#ifdef MM64
+  if (caller == NULL || caller->mm == NULL)
+    return -1;
+  *pte = pte_get_entry(caller->mm, pgn, caller);
+  return 0;
+#elif defined(DMA_REAL_PTE)
   *pte = pte_get_entry(caller->mm, pgn, caller);
   return 0;
 #else
