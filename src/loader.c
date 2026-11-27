@@ -31,25 +31,29 @@
 
 static uint32_t avail_pid = 1;
 
-/* One row per opcode: its name and how many arguments it accepts. */
+/* One row per opcode: its name, how many arguments it accepts, and which
+ * arguments may be negative (bit i = arg_i). */
 struct op_spec {
 	const char *name;
 	enum ins_opcode_t opcode;
 	int min_args;
 	int max_args;
+	unsigned neg_mask;
 };
 
 static const struct op_spec op_table[] = {
-	{ "calc",           CALC,           0, 0 },
-	{ "alloc",          ALLOC,          2, 2 },  /* alloc [size] [reg]  */
-	{ "free",           FREE,           1, 1 },  /* free [reg]          */
-	{ "read",           READ,           3, 3 },  /* read [src] [off] [dst] */
-	{ "write",          WRITE,          3, 3 },  /* write [data] [dst] [off] */
-	{ "kmalloc",        KMALLOC,        2, 2 },  /* kmalloc [size] [reg] */
-	{ "copy_from_user", COPY_FROM_USER, 4, 4 },
-	{ "copy_to_user",   COPY_TO_USER,   4, 4 },
-	{ "dma_memcpy",     DMA_MEMCPY,     4, 4 },
-	{ "syscall",        SYSCALL,        1, 4 },  /* syscall [nr] [args..] */
+	{ "calc",           CALC,           0, 0, 0 },
+	{ "alloc",          ALLOC,          2, 2, 0 },  /* alloc [size] [reg]  */
+	{ "free",           FREE,           1, 1, 0 },  /* free [reg]          */
+	{ "read",           READ,           3, 3, 0 },  /* read [src] [off] [dst] */
+	/* write [data] [dst] [off]: data is a byte value, and the course
+	 * programs use negative ones (sc2: "write -1 1 2" stores 0xFF) */
+	{ "write",          WRITE,          3, 3, 1u << 0 },
+	{ "kmalloc",        KMALLOC,        2, 2, 0 },  /* kmalloc [size] [reg] */
+	{ "copy_from_user", COPY_FROM_USER, 4, 4, 0 },
+	{ "copy_to_user",   COPY_TO_USER,   4, 4, 0 },
+	{ "dma_memcpy",     DMA_MEMCPY,     4, 4, 0 },
+	{ "syscall",        SYSCALL,        1, 4, 0 },  /* syscall [nr] [args..] */
 };
 #define NUM_OPS ((int)(sizeof(op_table) / sizeof(op_table[0])))
 
@@ -91,11 +95,14 @@ static char *next_line(FILE *f, char *buf, size_t len, int *lineno,
 }
 
 /*
- * Parse the arguments in "s" into args[]. Returns the number of arguments,
- * or -1 on error with *err describing the problem.
+ * Parse the arguments in "s" into args[]. Argument i may be negative only
+ * if bit i of neg_mask is set; it is then stored in two's complement
+ * (e.g. -1 -> all ones, which a BYTE cast turns into 0xFF).
+ * Returns the number of arguments, or -1 on error with *err describing the
+ * problem.
  */
 static int parse_args(const char *s, arg_t *args, int min_args, int max_args,
-		      const char **err)
+		      unsigned neg_mask, const char **err)
 {
 	int n = 0;
 	const char *p = s;
@@ -110,25 +117,31 @@ static int parse_args(const char *s, arg_t *args, int min_args, int max_args,
 			*err = "too many arguments";
 			return -1;
 		}
-		if (*p == '-') {
+
+		int neg = (*p == '-');
+		if (neg && !(neg_mask & (1u << n))) {
 			*err = "negative argument is not allowed";
 			return -1;
 		}
+		const char *digits = neg ? p + 1 : p;
 
 		char *end;
-		int base = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) ? 16 : 10;
+		int base = (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
+				   ? 16 : 10;
 
 		errno = 0;
-		unsigned long long v = strtoull(p, &end, base);
-		if (end == p || (*end != '\0' && !isspace((unsigned char)*end))) {
+		unsigned long long v = strtoull(digits, &end, base);
+		if (end == digits || *digits == '-' || *digits == '+' ||
+		    (*end != '\0' && !isspace((unsigned char)*end))) {
 			*err = "argument is not a number";
 			return -1;
 		}
-		if (errno == ERANGE || v > (unsigned long long)((arg_t)-1)) {
+		if (errno == ERANGE || v > (unsigned long long)((arg_t)-1) ||
+		    (neg && v > (unsigned long long)INT64_MAX)) {
 			*err = "argument is out of range";
 			return -1;
 		}
-		args[n++] = (arg_t)v;
+		args[n++] = neg ? (arg_t)(-(long long)v) : (arg_t)v;
 		p = end;
 	}
 
@@ -149,10 +162,19 @@ static const struct op_spec *find_op(const char *name)
 	return NULL;
 }
 
-/* Register operands must be in [0, NUM_REGS), or run() would index
- * proc->regs[] out of bounds. Returns an error message or NULL. */
+/* Without paging, register operands index proc->regs[] directly in run(),
+ * so they must be in [0, NUM_REGS). Returns an error message or NULL.
+ *
+ * With MM_PAGING these operands are region ids (symrgtbl index): libmem
+ * checks them against PAGING_MAX_SYMTBL_SZ and the instruction fails at run
+ * time. The read destination is only stored when it is a valid register
+ * (cpu.c). The course programs rely on this ("read 1 20 20" in p0s). */
 static const char *check_regs(const struct inst_t *ins)
 {
+#ifdef MM_PAGING
+	(void)ins;
+	return NULL;
+#endif
 	switch (ins->opcode) {
 	case ALLOC:
 	case KMALLOC:
@@ -196,7 +218,7 @@ struct pcb_t *load(const char *path)
 	line = next_line(file, buf, sizeof(buf), &lineno, path);
 	if (line == NULL)
 		die(path, 0, "empty file, expected '[priority] [N]'");
-	if (parse_args(line, hdr, 2, 2, &err) < 0)
+	if (parse_args(line, hdr, 2, 2, 0, &err) < 0)
 		die(path, lineno, err);
 	if (hdr[0] > UINT32_MAX || hdr[1] > MAX_INSTS)
 		die(path, lineno, "priority or number of instructions too large");
@@ -257,7 +279,7 @@ struct pcb_t *load(const char *path)
 		arg_t args[MAX_ARGS] = { 0 };
 
 		if (parse_args(line + n, args, spec->min_args, spec->max_args,
-			       &err) < 0) {
+			       spec->neg_mask, &err) < 0) {
 			printf("Loader error: %s:%d: '%s': %s\n",
 			       path, lineno, spec->name, err);
 			exit(1);

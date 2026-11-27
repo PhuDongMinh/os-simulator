@@ -122,11 +122,14 @@ switch (ins.opcode)
 	{
 		/* libread() stores the byte it read through its last argument.
 		 * ins is a local copy and arg_2 is the destination register
-		 * INDEX, so pass a temporary and write proc->regs[] ourselves. */
+		 * INDEX, so pass a temporary and write proc->regs[] ourselves.
+		 * The loader does not bound arg_2 in paging mode (course programs
+		 * use e.g. "read 1 20 20"): store only into a real register. */
 		uint32_t val = 0;
+		const arg_t nregs = sizeof(proc->regs) / sizeof(proc->regs[0]);
 
 		stat = libread(proc, ins.arg_0, ins.arg_1, &val);
-		if (stat == 0)
+		if (stat == 0 && ins.arg_2 < nregs)
 			proc->regs[ins.arg_2] = val;
 	}
 #else
