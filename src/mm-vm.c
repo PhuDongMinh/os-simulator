@@ -46,10 +46,15 @@ struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid)
   return pvma;
 }
 
+/* sys_memmap SYSMEM_SWP_OP: copy RAM frame @vicfpn to frame @swpfpn of the
+ * active swap device.  Return 0, or -1 if a device is missing or a frame is
+ * out of range (pg_getpage then keeps the victim resident). */
 int __mm_swap_page(struct pcb_t *caller, addr_t vicfpn , addr_t swpfpn)
 {
-    __swap_cp_page(caller->krnl->mram, vicfpn, caller->krnl->active_mswp, swpfpn);
-    return 0;
+    if (caller == NULL || caller->krnl == NULL)
+        return -1;
+    return __swap_cp_page(caller->krnl->mram, vicfpn,
+                          caller->krnl->active_mswp, swpfpn);
 }
 
 /*get_vm_area_node - get vm area for a number of pages

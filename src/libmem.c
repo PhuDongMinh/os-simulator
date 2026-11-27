@@ -258,95 +258,103 @@ printf("%s:%d\n",__func__,__LINE__);
   return 0;//val;
 }
 
+#ifdef MM64
+static struct memphy_struct *swap_dev_of(struct krnl_t *krnl, addr_t typ);
+#endif
+
 /*pg_getpage - get the page in ram
- *@mm: memory region
- *@pagenum: PGN
- *@framenum: return FPN
+ *@mm: address space (must be caller->mm; NULL means caller->mm)
+ *@pgn: page number
+ *@fpn: return FPN
  *@caller: caller
  *
+ * Make page @pgn of the caller's user space resident and return its frame.
+ * - PRESENT: nothing to do.
+ * - SWAPPED: swap-in.  A free RAM frame is used if there is one; otherwise
+ *   the oldest evictable page of the FIFO (mm64_fifo_victim: resident, not
+ *   DMA-pinned) is copied to the active swap with syscall SYSMEM_SWP_OP,
+ *   its PTE marked swapped, and its frame reused.  The target is then
+ *   copied in from its own swap device, mapped, its swap slot released and
+ *   it enters the FIFO.
+ * - Never mapped (PTE without PRESENT/SWAPPED, e.g. 0): -1, invalid access.
+ * Kernel memory is never paged (its own path, __read/__write_kernel_mem):
+ * any other mm is refused.  On failure the target page and the FIFO are
+ * unchanged.  Caller holds mmvm_lock.
  */
 int pg_getpage(struct mm_struct *mm, addr_t pgn, int *fpn, struct pcb_t *caller)
 {
-  if (mm != NULL && mm != caller->mm)
-  {
-    uint64_t kpte = pte_get_entry(mm, pgn, caller);
-    if (!PAGING_PAGE_PRESENT(kpte))
-    {
-      addr_t kfpn = 0;
-      if (MEMPHY_get_freefp(caller->krnl->mram, &kfpn) == 0)
-      {
-        pte_set_fpn(mm, pgn, kfpn, caller);
-        enlist_pgn_node(&mm->fifo_pgn, pgn);
-      }
-      else
-      {
-        return -1;
-      }
-    }
-    *fpn = PAGING_FPN(pte_get_entry(mm, pgn, caller));
+#ifdef MM64
+  if (caller == NULL || caller->krnl == NULL || caller->krnl->mram == NULL ||
+      fpn == NULL)
+    return -1;
+  if (mm == NULL)
+    mm = caller->mm;
+  if (mm == NULL || mm != caller->mm)
+    return -1;
+
+  struct krnl_t *krnl = caller->krnl;
+  struct memphy_struct *ram = krnl->mram;
+  addr_t pte = pte_get_entry(mm, pgn, caller);
+
+  if (PAGING_PAGE_PRESENT(pte) && !(pte & PAGING_PTE_SWAPPED_MASK)) {
+    *fpn = (int)PAGING_FPN(pte);
     return 0;
   }
+  if (!(pte & PAGING_PTE_SWAPPED_MASK))
+    return -1;                                  /* never mapped */
 
-  uint64_t pte = pte_get_entry(caller->mm, pgn, caller);
+  /* Page is not online, make it actively living */
+  struct memphy_struct *src = swap_dev_of(
+      krnl, GETVAL(pte, PAGING_PTE_SWPTYP_MASK, PAGING_PTE_SWPTYP_LOBIT));
+  addr_t srcoff = PAGING_PTE_SWP(pte);
+  addr_t tgtfpn;
+  if (src == NULL)
+    return -1;
 
-  if (!PAGING_PAGE_PRESENT(pte))
-  { /* Page is not online, make it actively living */
-    addr_t vicpgn;
-    addr_t vicpte;
+  if (MEMPHY_get_freefp(ram, &tgtfpn) != 0) {
+    /* RAM full: evict a victim to the active swap */
     addr_t vicfpn, swpfpn;
+    struct pgn_t **link = mm64_fifo_victim(mm, &vicfpn);
+    if (link == NULL || krnl->active_mswp == NULL ||
+        MEMPHY_get_freefp(krnl->active_mswp, &swpfpn) != 0)
+      return -1;                                /* nothing changed */
+
+    /* SWP(vicfpn -> swpfpn) through SYSCALL 17 sys_memmap */
     struct sc_regs regs;
-
-    /* TODO Initialize the target frame storing our variable */
-//  addr_t tgtfpn 
-    addr_t tgtfpn = PAGING_SWP(pte);
-
-    /* TODO: Play with your paging theory here */
-    /* Find victim page */
-    if (find_victim_page(caller->mm, &vicpgn) == -1)
-    {
-      return -1;
-    }
-
-    /* Get free frame in MEMSWP */
-    if (MEMPHY_get_freefp(caller->krnl->active_mswp, &swpfpn) == -1)
-    {
-      return -1;
-    }
-
-    /* TODO: Implement swap frame from MEMRAM to MEMSWP and vice versa*/
-    vicpte = pte_get_entry(caller->mm, vicpgn, caller);
-    vicfpn = PAGING_FPN(vicpte);
-
-    /* TODO copy victim frame to swap 
-     * SWP(vicfpn <--> swpfpn)
-     * SYSCALL 1 sys_memmap
-     */
     regs.a1 = SYSMEM_SWP_OP;
     regs.a2 = vicfpn;
     regs.a3 = swpfpn;
-    _syscall(caller->krnl, caller->pid, 17, &regs);
-
-    if (pte & PAGING_PTE_SWAPPED_MASK)
-    {
-      __swap_cp_page(caller->krnl->active_mswp, tgtfpn, caller->krnl->mram, vicfpn);
-      MEMPHY_put_freefp(caller->krnl->active_mswp, tgtfpn);
+    if (_syscall(krnl, caller->pid, 17, &regs) != 0) {
+      MEMPHY_put_freefp(krnl->active_mswp, swpfpn);
+      return -1;                                /* victim still resident */
     }
 
-
-    /* Update page table */
-    //pte_set_swap(...);
-    pte_set_swap(caller, vicpgn, caller->krnl->active_mswp_id, swpfpn);
-
-    /* Update its online status of the target page */
-    //pte_set_fpn(...);
-    pte_set_fpn(caller->mm, pgn, vicfpn, caller);
-
-    enlist_pgn_node(&caller->mm->fifo_pgn, pgn);
+    /* Commit the victim: it now lives in swap, its frame is ours */
+    struct pgn_t *vic = *link;
+    *link = vic->pg_next;
+    pte_set_swap(caller, vic->pgn, (int)krnl->active_mswp_id, swpfpn);
+    free(vic);
+    tgtfpn = vicfpn;
   }
 
-  *fpn = PAGING_FPN(pte_get_entry(caller->mm,pgn, caller));
+  /* Copy the target in, then map it.  On failure the frame goes back to
+   * RAM and the target stays in swap (its slot is kept). */
+  if (__swap_cp_page(src, srcoff, ram, tgtfpn) != 0 ||
+      pte_set_fpn(mm, pgn, tgtfpn, caller) != 0) {
+    MEMPHY_put_freefp(ram, tgtfpn);
+    return -1;
+  }
+  MEMPHY_put_freefp(src, srcoff);               /* swap slot is free again */
+  if (enlist_pgn_node(&mm->fifo_pgn, pgn) != 0)
+    printf("[mm] WARNING: page %llu is resident but not in the FIFO\n",
+           (unsigned long long)pgn);
 
+  *fpn = (int)tgtfpn;
   return 0;
+#else
+  (void)mm; (void)pgn; (void)fpn; (void)caller;
+  return -1;                                    /* 32-bit paging: mm.c */
+#endif
 }
 
 /*pg_getval - read value at given offset
@@ -385,7 +393,8 @@ int pg_getval(struct mm_struct *mm, addr_t addr, BYTE *data, struct pcb_t *calle
   regs.a1 = SYSMEM_IO_READ;
   regs.a2 = phyaddr;
   regs.a3 = 0;
-  _syscall(caller->krnl, caller->pid, 17, &regs);
+  if (_syscall(caller->krnl, caller->pid, 17, &regs) != 0)
+    return -1;
   *data = (BYTE)regs.a3;
 
   return 0;
@@ -427,7 +436,8 @@ int pg_setval(struct mm_struct *mm, addr_t addr, BYTE value, struct pcb_t *calle
   regs.a1 = SYSMEM_IO_WRITE;
   regs.a2 = phyaddr;
   regs.a3 = value;
-  _syscall(caller->krnl, caller->pid, 17, &regs);
+  if (_syscall(caller->krnl, caller->pid, 17, &regs) != 0)
+    return -1;
 
   return 0;
 }
@@ -1658,30 +1668,18 @@ int free_pcb_memph(struct pcb_t *caller)
  */
 int find_victim_page(struct mm_struct *mm, addr_t *retpgn)
 {
-  struct pgn_t *pg = mm->fifo_pgn;
-
-  /* TODO: Implement the theorical mechanism to find the victim page */
-  if (!pg)
-  {
+  /* FIFO: the oldest page that can be evicted (resident, not pinned by
+   * the DMA), the same policy as alloc_pages_range and pg_getpage.
+   * Its node leaves the FIFO; the caller swaps the page out. */
+  addr_t vicfpn;
+  struct pgn_t **link = (retpgn != NULL) ? mm64_fifo_victim(mm, &vicfpn) : NULL;
+  if (link == NULL)
     return -1;
-  }
-  struct pgn_t *prev = NULL;
-  while (pg->pg_next)
-  {
-    prev = pg;
-    pg = pg->pg_next;
-  }
-  *retpgn = pg->pgn;
-  if (prev == NULL)
-  {
-    mm->fifo_pgn = NULL;
-    free(pg);
-    return 0;
-  }
-  prev->pg_next = NULL;
 
-  free(pg);
-
+  struct pgn_t *vic = *link;
+  *link = vic->pg_next;
+  *retpgn = vic->pgn;
+  free(vic);
   return 0;
 }
 

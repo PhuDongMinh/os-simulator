@@ -578,12 +578,17 @@ struct pending_evict {
   struct pending_evict *next;
 };
 
-/* Oldest FIFO page of @mm that may be evicted: resident and not pinned by
- * the DMA.  Return the link that points to its node (NULL if none). */
-static struct pgn_t **fifo_pick_victim(struct mm_struct *mm, addr_t *vicfpn)
+/* mm64_fifo_victim - oldest FIFO page of @mm that may be evicted: resident
+ * and not pinned by the DMA.  *vicfpn receives its frame.  Return the link
+ * that points to its node (NULL if none); the node is not detached.
+ * Shared by alloc_pages_range, find_victim_page and pg_getpage so that
+ * every eviction follows the same policy.  Caller holds mmvm_lock. */
+struct pgn_t **mm64_fifo_victim(struct mm_struct *mm, addr_t *vicfpn)
 {
   struct pgn_t **pick = NULL;
 
+  if (mm == NULL || vicfpn == NULL)
+    return NULL;
   for (struct pgn_t **link = &mm->fifo_pgn; *link != NULL;
        link = &(*link)->pg_next) {
     addr_t pte = pte_get_entry(mm, (*link)->pgn, NULL);
@@ -638,7 +643,7 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
     } else {
       /* RAM is full: evict the oldest evictable page of this process */
       struct pending_evict *ev = (swp != NULL) ? malloc(sizeof(*ev)) : NULL;
-      struct pgn_t **link = (ev != NULL) ? fifo_pick_victim(mm, &fpn) : NULL;
+      struct pgn_t **link = (ev != NULL) ? mm64_fifo_victim(mm, &fpn) : NULL;
       if (link == NULL || MEMPHY_get_freefp(swp, &ev->swpfpn) != 0) {
         free(ev);
         free(fr);
@@ -866,9 +871,15 @@ int enlist_vm_rg_node(struct vm_rg_struct **rglist, struct vm_rg_struct *rgnode)
   return 0;
 }
 
+/* Push @pgn at the head of @plist (FIFO: newest first).  0, or -1 when
+ * the list is NULL or the host allocation fails (list unchanged). */
 int enlist_pgn_node(struct pgn_t **plist, addr_t pgn)
 {
+  if (plist == NULL)
+    return -1;
   struct pgn_t *pnode = malloc(sizeof(struct pgn_t));
+  if (pnode == NULL)
+    return -1;
 
   pnode->pgn = pgn;
   pnode->pg_next = *plist;
@@ -939,21 +950,65 @@ int print_list_pgn(struct pgn_t *ip)
   return 0;
 }
 
+/*
+ * print_pgtbl - dump the page directories of caller->mm (PAGETBL_DUMP)
+ * @start, @end: virtual address range, inclusive (libmem passes 0, -1)
+ *
+ * Prints one line with the host addresses of the tables on the path to the
+ * first mapped page of the range, in the format of the reference outputs:
+ *   " PDG=<pgd> P4D=<p4d> PUD=<pud> PMD=<pmd>PT=<pt>"
+ * With nothing mapped in the range only the root is non-NULL.
+ * Return 0, or -1 if caller->mm has no page table.
+ */
 int print_pgtbl(struct pcb_t *caller, addr_t start, addr_t end)
 {
-//addr_t pgn = ...
-//addr_t pgit = ...
-//struct mm_struct *mm = ...
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
+  if (caller == NULL || caller->mm == NULL || caller->mm->pgd == NULL)
+    return -1;
 
-  get_pd_from_address(start, &pgd, &p4d, &pud, &pmd, &pt);
+  const unsigned int sh = PAGING64_PT_INDEX_BITS;
+  addr_t spgn = start >> PAGING64_ADDR_PT_SHIFT;
+  addr_t epgn = end >> PAGING64_ADDR_PT_SHIFT;
+  struct pt_pgd *root = caller->mm->pgd;
+  void *p4d_n = NULL, *pud_n = NULL, *pmd_n = NULL, *pt_n = NULL;
 
-  /* TODO traverse the page map and dump the page directory entries */
+  pthread_mutex_lock(&root->lock);
+  for (addr_t i5 = 0; i5 < PAGING64_PT_ENTRIES; ++i5) {
+    struct pt_p4d *p4d = root->child[i5];
+    if (p4d == NULL)
+      continue;
+    addr_t high = (i5 >= PAGING64_PT_ENTRIES / 2)
+                      ? (PT_PGN_HIGH_KERNEL << PT_PGN_SIGN_BIT) : 0;
+    for (addr_t i4 = 0; i4 < PAGING64_PT_ENTRIES; ++i4) {
+      struct pt_pud *pud = p4d->child[i4];
+      if (pud == NULL)
+        continue;
+      for (addr_t i3 = 0; i3 < PAGING64_PT_ENTRIES; ++i3) {
+        struct pt_pmd *pmd = pud->child[i3];
+        if (pmd == NULL)
+          continue;
+        for (addr_t i2 = 0; i2 < PAGING64_PT_ENTRIES; ++i2) {
+          struct pt_leaf *leaf = pmd->child[i2];
+          if (leaf == NULL)
+            continue;
+          for (addr_t i1 = 0; i1 < PAGING64_PT_ENTRIES; ++i1) {
+            addr_t pgn = high | (i5 << (4 * sh)) | (i4 << (3 * sh)) |
+                         (i3 << (2 * sh)) | (i2 << sh) | i1;
+            if (pgn > epgn)
+              goto done;               /* pgns only grow from here */
+            if (pgn < spgn || leaf->entry[i1] == 0)
+              continue;
+            p4d_n = p4d; pud_n = pud; pmd_n = pmd; pt_n = leaf;
+            goto done;
+          }
+        }
+      }
+    }
+  }
+done:
+  pthread_mutex_unlock(&root->lock);
 
+  printf(" PDG=%16p P4D=%16p PUD=%16p PMD=%16pPT=%16p\n",
+         (void *)root, p4d_n, pud_n, pmd_n, pt_n);
   return 0;
 }
 

@@ -155,6 +155,13 @@ flowchart LR
 
 > Giới hạn RAM: FPN 16 bit → tối đa 65536 frame × 4 KiB = **256 MiB** (xem §6).
 > `os.c` chặn config lớn hơn trước khi gọi `init_memphy`.
+> RAM < 4 KiB (vd. `os_syscall`, `small_1K`: 2048 byte) có **0 frame** với page 4 KiB:
+> mọi `alloc` đều thất bại. Các config này được thiết kế cho page 256 byte (32-bit).
+
+> **Quy tắc:** `free_fp_list` / `used_fp_list` là dữ liệu nội bộ của M1. Module khác
+> chỉ lấy/trả frame qua `MEMPHY_get_freefp(_range)` / `MEMPHY_put_freefp`
+> (frame đang dùng nằm trong `used_fp_list`; sửa thẳng danh sách sẽ làm frame không
+> trả về được).
 
 #### Bảng trang (Stage 1 ✅ — xem `STAGE_1_PAGETABLE.md`)
 
@@ -168,19 +175,26 @@ flowchart LR
 | `pte_clear_entry(mm, pgn, caller)` ✅ | M1, M3 (`__kfree`) | — | PTE = 0. Không trả frame (người gọi tự trả). |
 | `pte_set_entry(mm, pgn, val, caller)` ✅ | M1 | `val` vừa 32 bit | Ghi nguyên giá trị, từ chối nếu `val > UINT32_MAX`. |
 
-#### Mapping, swap, dịch địa chỉ ⛔
+#### Mapping, swap, dịch địa chỉ ✅
+
+Người gọi giữ `mmvm_lock` (bảo vệ FIFO, danh sách vma và chuỗi "kiểm tra rồi map").
+FIFO hiện **riêng từng tiến trình** (`mm->fifo_pgn`, mới nhất ở đầu) — xem §7.
+Test: `tests/run_mm64_map_tests.sh`, `run_swap_tests.sh`, `run_mm_teardown_tests.sh`.
 
 | Hàm | Ai gọi | Contract |
 |---|---|---|
-| `vm_map_ram(caller, astart, aend, mapstart, n, &rg)` | M2 (`inc_vma_limit`) | Map `n` page bắt đầu tại `mapstart` (căn 4 KiB) vào `caller->mm`. Thành công: mọi page PRESENT, nằm trong FIFO, `rg = [mapstart, mapstart + n·4096)`. Thất bại: **rollback** toàn bộ, trả `< 0`. |
-| `alloc_pages_range(caller, n, &list)` | M1 nội bộ | Lấy `n` frame RAM; thiếu thì evict victim; không đủ → trả lại hết, `-1`. |
-| `vmap_page_range(caller, addr, n, frames, &rg)` | M1 nội bộ | Ghi PTE cho từng page theo danh sách frame. |
-| `pg_getpage(mm, pgn, &fpn, caller)` | M2 (`pg_getval/setval`), M4 (DMA) | Page PRESENT → trả `fpn`. Page SWAPPED → swap-in rồi trả `fpn`. PTE = 0 (chưa từng map) → `-1` (lỗi truy cập). **[ĐỀ XUẤT]** đổi `int pgn, int *fpn` thành `addr_t`. |
-| `find_victim_page(…)` | M1 nội bộ | Chọn FIFO, bỏ qua page kernel và page **đang bị ghim** (DMA). |
-| `vmap_pgd_memset(caller, addr, n)` | M3 (`SYSMEM_MAP_OP`) | Điền mẫu vào PTE của một dải (dùng cho debug/reserve). |
-| `free_pcb_memph(caller)` ⛔ | M4 (khi tiến trình kết thúc) | Trả mọi frame RAM + slot SWAP của `caller->mm`, giải phóng mọi node cây, FIFO, VMA, free-list, mutex. **Không** đụng kernel mm. |
-| `print_pgtbl(caller, start, end)` ⛔ | M2 (sau alloc/read/write khi bật `PAGETBL_DUMP`) | In các PTE khác 0 trong khoảng, kèm 5 chỉ số. |
-| **[ĐỀ XUẤT]** `mm_pin_page / mm_unpin_page(mm, pgn)` | M4 (DMA) | Page bị ghim không được chọn làm victim cho tới khi unpin. |
+| `vm_map_ram(caller, astart, aend, mapstart, n, &rg)` ✅ | M2 (`__alloc` / `inc_vma_limit`) | Map `n` page bắt đầu tại `mapstart` (căn 4 KiB, trong vma, ≤ `vm_limit`) vào `caller->mm`. Thành công: mọi page PRESENT, nằm trong FIFO, `rg = [mapstart, mapstart + n·4096)` (`rg` có thể NULL). Page đã map → từ chối. Thất bại: **không đổi gì** (PTE, frame, slot swap, FIFO), trả `< 0`. |
+| `alloc_pages_range(caller, n, &list)` ✅ | M1 nội bộ | Frame RAM trống trước; hết thì evict page cũ nhất của FIFO sang swap đang dùng (bỏ qua page bị DMA ghim). Victim chỉ được commit khi đủ `n` frame; không đủ → khôi phục victim + slot, trả `-3000`. |
+| `vmap_page_range(caller, addr, n, frames, &rg)` ✅ | M1 nội bộ | Map `min(n, số frame)` page theo danh sách frame; page phải chưa map. |
+| `pg_getpage(mm, pgn, &fpn, caller)` ✅ | M2 (`pg_getval/setval`) | `mm` phải là `caller->mm` (NULL = `caller->mm`); kernel mm → `-1`. PRESENT → trả `fpn`. SWAPPED → swap-in: frame trống trước, không có thì evict victim qua syscall `SYSMEM_SWP_OP`; đọc page từ **đúng thiết bị swap ghi trong PTE**, trả slot đó, đưa page vào FIFO. Chưa từng map → `-1`. Lỗi → page đích và FIFO không đổi. |
+| `find_victim_page(mm, &pgn)` ✅ | M1 | Page cũ nhất có thể evict (đang ở RAM, không bị DMA ghim); gỡ node khỏi FIFO. |
+| `mm64_fifo_victim(mm, &fpn)` ✅ | M1 nội bộ | Tiêu chí chọn victim dùng chung cho 3 hàm trên; không gỡ node. |
+| `vmap_pgd_memset(caller, addr, n)` ✅ | M3 (`SYSMEM_MAP_OP`) | Ghi mẫu `0xdeadbeef` vào PTE của cả dải hoặc không page nào. |
+| `__swap_cp_page`, `__mm_swap_page` ✅ | M1, syscall `SYSMEM_SWP_OP` | Chép 1 frame giữa 2 thiết bị; trả `-1` nếu thiếu thiết bị / frame ngoài phạm vi. |
+| `free_pcb_memph(caller)` ✅ | M4 (khi tiến trình kết thúc) | Trả mọi frame RAM + slot SWAP (về đúng thiết bị) của `caller->mm`, giải phóng cây, FIFO, VMA, free-list. **Không** đụng kernel mm. `mm_struct` do `os.c` free. |
+| `mm64_pt_foreach(mm, fn, ctx)` ✅ | M1 | Duyệt mọi PTE khác 0 theo thứ tự pgn (giữ khóa cây; `fn` không được gọi `pte_*` trên cùng mm). |
+| `print_pgtbl(caller, start, end)` ✅ | M2 (sau alloc/free/read/write khi bật `PAGETBL_DUMP`) | Một dòng ` PDG=… P4D=… PUD=… PMD=…PT=…` (địa chỉ các bảng trên đường tới page đầu tiên đã map trong khoảng), đúng định dạng output mẫu. |
+| DMA ghim frame ✅ | M4 | Qua `dma_frame_pinned(fpn)` (libmem.c); M1 không chọn frame đang ghim làm victim. |
 
 ### 3.2 M2 — Virtual memory & user API (Huyền)
 
@@ -443,9 +457,9 @@ Page đang ở SWAP (PRESENT=0, SWAPPED=1) — không đổi so với spec
 
 - [ ] Thêm macro `PAGING64_PGN / PAGING64_OFFST / PAGING64_PHYADDR`; M2, M3 bỏ `PAGING_PGN`, `PAGE_SIZE` cũ.
 - [ ] Đổi kiểu trả về của `vm_map_ram` / `alloc_pages_range` sang `int`; `pg_getpage` dùng `addr_t`.
-- [ ] FIFO victim **theo tiến trình** hay **toàn cục** trong `krnl`. M1 đề xuất **toàn cục**: test RAM nhỏ có 8 tiến trình chung 1 frame.
-- [ ] Vị trí và kích thước vma0 cùng layout kiểu macOS (M2/M3), base của kernel space.
-- [ ] Cơ chế ghim frame cho DMA (bit 29 hay cờ riêng) và API `mm_pin_page / mm_unpin_page`.
+- [ ] FIFO victim **theo tiến trình** hay **toàn cục** trong `krnl`. Hiện: theo tiến trình. M1 đề xuất **toàn cục**: với `os_1_mlq_paging_small_4K` (1 frame) tiến trình sau không evict được page của tiến trình trước nên `alloc` thất bại.
+- [x] Vị trí và kích thước vma0 cùng layout kiểu macOS: user `[0x1000, 0x00FF…FF]`, kernel `[0xFF00…00, 0xFF…FF]`, giới hạn qua `vma->vm_limit`.
+- [x] Ghim frame cho DMA: đếm theo frame trong `libmem.c` (`dma_frame_pinned`), không dùng bit PTE.
 - [x] `os.c`: `os.krnl_pgd = os.mm->pgd` sau `init_mm(os.mm, NULL)` (Stage 2).
 - [x] FPN mở rộng 16 bit (256 MiB), `os.c` chặn config lớn hơn (Stage 2).
-- [ ] Thứ tự cleanup khi tiến trình kết thúc (§4.5) và chờ DMA trước khi free.
+- [x] Thứ tự cleanup khi tiến trình kết thúc (§4.5): chờ DMA → gỡ registry → `__kfree` → `free_pcb_memph` → `free(mm)` → `finish_proc` → PCB.

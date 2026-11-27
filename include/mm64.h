@@ -108,6 +108,11 @@ void mm64_pgd_destroy(struct mm_struct *mm);
 typedef void (*mm64_pte_visit_fn)(addr_t pgn, addr_t pte, void *ctx);
 int mm64_pt_foreach(struct mm_struct *mm, mm64_pte_visit_fn fn, void *ctx);
 
+/* Oldest evictable page of @mm's FIFO (resident, not DMA-pinned):
+ * returns the link to its node (not detached) and its frame in *vicfpn,
+ * or NULL when no page can be evicted.  Caller holds mmvm_lock. */
+struct pgn_t **mm64_fifo_victim(struct mm_struct *mm, addr_t *vicfpn);
+
 #ifdef __cplusplus
 }
 #endif
