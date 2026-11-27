@@ -19,6 +19,7 @@
 #include "dma.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <limits.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -497,104 +498,154 @@ int libkmem_malloc(struct pcb_t * caller, uint32_t size, uint32_t reg_index)
 }
 
 
+/* Map one kernel page @pgn -> RAM frame @fpn. kmm_lock held. 0 / -1. */
+static int kmem_map_page(struct pcb_t *caller, addr_t pgn, addr_t fpn)
+{
+#ifdef MM64
+  return pte_set_fpn(caller->krnl->mm, pgn, fpn, caller);
+#else
+  if (pgn >= PAGING_MAX_PGN)
+    return -1;
+  caller->krnl->krnl_pgd[pgn] =
+      ((uint32_t)fpn << PAGING_PTE_FPN_LOBIT) | PAGING_PTE_PRESENT_MASK;
+  return 0;
+#endif
+}
+
+/* Clear the kernel PTE of @pgn (does not release the frame). kmm_lock held. */
+static void kmem_unmap_page(struct pcb_t *caller, addr_t pgn)
+{
+#ifdef MM64
+  pte_clear_entry(caller->krnl->mm, pgn, caller);
+#else
+  if (pgn < PAGING_MAX_PGN)
+    caller->krnl->krnl_pgd[pgn] = 0;
+#endif
+}
+
+/* Return @fpn to RAM; a failure means the frame was not checked out, i.e.
+ * a frame-accounting bug somewhere: report it instead of hiding it. */
+static void kmem_put_frame(struct pcb_t *caller, addr_t fpn)
+{
+  if (MEMPHY_put_freefp(caller->krnl->mram, fpn) != 0)
+    printf("[kmem] WARNING: pid %u cannot return frame %llu to RAM\n",
+           caller->pid, (unsigned long long)fpn);
+}
+
 /*kmalloc - alloc region memory in kmem
  *@caller: caller
  *@vmaid: ID vm area to alloc memory region
  *@rgid: memory region ID (used to identify variable in symbole table)
  *@size: memory size
  *@alloc_addr: allocated address
+ *
+ * Kernel memory: physically CONTIGUOUS frames (MEMPHY_get_freefp_range),
+ * mapped in the shared kernel mm, never put in the FIFO (never swapped).
+ * Either everything succeeds or nothing changes (frames, PTEs, vma, tables).
  */
 addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *alloc_addr)
 {
   if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL ||
+      caller->krnl->mram == NULL || alloc_addr == NULL ||
       rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ || size == 0)
     return -1;
-  /* TODO: provide OS kernel memory allocation
-   *       update krnl_pgd for OS kernel level management */
 
-  //struct krnl_t *krnl = caller->krnl;
-  //krnl->symrgtbl...
-  //krnl->krnl_pgd ...
+  struct mm_struct *kmm = caller->krnl->mm;
 
-  /* Bảo vệ vùng nhớ Kernel bằng khóa kmm_lock */
+  /* Page-aligned size; reject sizes whose alignment overflows or whose page
+   * count does not fit in int (MEMPHY_get_freefp_range takes an int). */
+  addr_t aligned_sz = OS_PAGE_ALIGN(size);
+  if (aligned_sz < size || aligned_sz / OS_PAGESZ > (addr_t)INT_MAX)
+    return -1;
+  int num_pages = (int)(aligned_sz / OS_PAGESZ);
+
   pthread_mutex_lock(&kmm_lock);
 
-  /* Khong cho ghi de rgid dang giu vung nho kernel */
+  /* 1. rgid of the process must not already hold a kernel region */
   if (caller->kmap_slot[rgid] != -1) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  /* 1. Tim slot trong trong os.mm->symrgtbl */
+  /* 2. Free slot in the shared kernel symbol table */
   int kslot = -1;
   for (int s = 0; s < PAGING_MAX_SYMTBL_SZ; s++) {
-    if (caller->krnl->mm->symrgtbl[s].rg_start == 0 &&
-        caller->krnl->mm->symrgtbl[s].rg_end == 0) {
+    if (kmm->symrgtbl[s].rg_start == 0 && kmm->symrgtbl[s].rg_end == 0) {
       kslot = s;
       break;
     }
   }
-  if (kslot == -1) {
+  struct vm_area_struct *cur_vma = get_vma_by_num(kmm, vmaid);
+  if (kslot == -1 || cur_vma == NULL) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  /* 2. Cap phat vat ly lien tuc (can chinh theo OS_PAGESZ de tranh 2 vung chung page & toi uu DMA) */
-  addr_t aligned_sz = OS_PAGE_ALIGN(size);
-  int num_pages = (int)(aligned_sz / OS_PAGESZ);
-  addr_t start_fpn = 0;
+  /* 3. Choose the virtual range, but do NOT commit it yet:
+   *    a) first fit in the free-region list (space returned by __kfree);
+   *    b) otherwise grow the kernel vma at its break. init_mm() leaves the
+   *       kernel free list with one EMPTY region, so (b) is the normal path. */
+  struct vm_rg_struct *hole = NULL;
+  addr_t vaddr = 0;
+  for (struct vm_rg_struct *rgit = cur_vma->vm_freerg_list; rgit != NULL;
+       rgit = rgit->rg_next) {
+    addr_t cand = OS_PAGE_ALIGN(rgit->rg_start);
+    if (cand >= rgit->rg_start && cand >= KERNEL_SPACE_START &&
+        cand <= rgit->rg_end && rgit->rg_end - cand >= aligned_sz) {
+      hole = rgit;
+      vaddr = cand;
+      break;
+    }
+  }
+  if (hole == NULL) {
+    addr_t brk = OS_PAGE_ALIGN(cur_vma->sbrk);
+    /* stay in kernel space; strict '<' keeps vaddr + aligned_sz from
+     * wrapping to 0 at the very top of the address space */
+    if (brk < cur_vma->sbrk || brk < KERNEL_SPACE_START ||
+        KERNEL_SPACE_END - brk < aligned_sz) {
+      pthread_mutex_unlock(&kmm_lock);
+      return -1;
+    }
+    vaddr = brk;
+  }
 
+  /* 4. Contiguous physical frames (memphy moves them to used_fp_list) */
+  addr_t start_fpn = 0;
   if (MEMPHY_get_freefp_range(caller->krnl->mram, num_pages, &start_fpn) != 0) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  /* 3. Tim vung nho ao trong trong os.mm (Kernel Space) */
-  struct vm_area_struct *cur_vma = get_vma_by_num(caller->krnl->mm, vmaid);
-  if (cur_vma == NULL) {
+  /* 5. Map every page. pte_set_fpn can fail (lazy table allocation):
+   *    then undo the PTEs already written and return all frames. */
+  int mapped = 0;
+  while (mapped < num_pages &&
+         kmem_map_page(caller, OS_VADDR_PGN(vaddr + (addr_t)mapped * OS_PAGESZ),
+                       start_fpn + (addr_t)mapped) == 0)
+    mapped++;
+
+  if (mapped < num_pages) {
+    for (int i = 0; i < mapped; i++)
+      kmem_unmap_page(caller, OS_VADDR_PGN(vaddr + (addr_t)i * OS_PAGESZ));
     for (int i = 0; i < num_pages; i++)
-      MEMPHY_put_freefp(caller->krnl->mram, start_fpn + i);
+      kmem_put_frame(caller, start_fpn + (addr_t)i);
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  struct vm_rg_struct *rgit = cur_vma->vm_freerg_list;
-  addr_t vaddr = 0;
-
-  while (rgit != NULL) {
-    addr_t cand = OS_PAGE_ALIGN(rgit->rg_start);
-    if (cand >= KERNEL_SPACE_START && cand <= rgit->rg_end &&
-        (rgit->rg_end - cand) >= aligned_sz) {
-      vaddr = cand;
-      rgit->rg_start = cand + aligned_sz;
-      break;
-    }
-    rgit = rgit->rg_next;
+  /* 6. Commit: nothing can fail from here on */
+  if (hole != NULL) {
+    hole->rg_start = vaddr + aligned_sz;
+  } else {
+    cur_vma->sbrk = vaddr + aligned_sz;
+    if (cur_vma->vm_end < cur_vma->sbrk)
+      cur_vma->vm_end = cur_vma->sbrk;
   }
 
-  if (vaddr == 0) {
-    for (int i = 0; i < num_pages; i++)
-      MEMPHY_put_freefp(caller->krnl->mram, start_fpn + i);
-    pthread_mutex_unlock(&kmm_lock);
-    return -1;
-  }
-
-  /* 4. Anh xa trang ao -> frame vat ly vao bang trang Kernel */
-  for (int i = 0; i < num_pages; i++) {
-    addr_t cur_fpn = start_fpn + i;
-    addr_t cur_vaddr = vaddr + (addr_t)i * OS_PAGESZ;
-    addr_t pgn = OS_VADDR_PGN(cur_vaddr);
-#ifdef MM64
-    pte_set_fpn(caller->krnl->mm, pgn, cur_fpn, caller);
-#else
-    uint32_t pte = (cur_fpn << PAGING_PTE_FPN_LOBIT) | PAGING_PTE_PRESENT_MASK;
-    caller->krnl->krnl_pgd[pgn] = pte;
-#endif
-  }
-
-  /* 5. Luu gioi han that [vaddr, vaddr + size] de copy_from/to_user check bien chinh xac */
-  caller->krnl->mm->symrgtbl[kslot].rg_start = vaddr;
-  caller->krnl->mm->symrgtbl[kslot].rg_end = vaddr + size;
+  /* Exact bounds [vaddr, vaddr + size) so copy_from/to_user check precisely */
+  kmm->symrgtbl[kslot].rg_start = vaddr;
+  kmm->symrgtbl[kslot].rg_end = vaddr + size;
+  kmm->symrgtbl[kslot].rg_next = NULL;
   caller->kmap_slot[rgid] = kslot;
   *alloc_addr = vaddr;
 
@@ -625,30 +676,31 @@ int __kfree(struct pcb_t *caller, int vmaid, int rgid)
   addr_t aligned_sz = OS_PAGE_ALIGN(rgnode->rg_end - rgnode->rg_start);
   int num_pages = (int)(aligned_sz / OS_PAGESZ);
 
+  /* Return each frame (via MEMPHY_put_freefp only), then clear its PTE */
   for (int i = 0; i < num_pages; i++) {
-    addr_t vaddr = rgnode->rg_start + (addr_t)i * OS_PAGESZ;
-    addr_t pgn = OS_VADDR_PGN(vaddr);
+    addr_t pgn = OS_VADDR_PGN(rgnode->rg_start + (addr_t)i * OS_PAGESZ);
 #ifdef MM64
     addr_t pte = pte_get_entry(caller->krnl->mm, pgn, caller);
-    if (PAGING_PAGE_PRESENT(pte)) {
-      addr_t fpn = PAGING_FPN(pte);
-      MEMPHY_put_freefp(caller->krnl->mram, fpn);
-      pte_clear_entry(caller->krnl->mm, pgn, caller);
-    }
 #else
-    uint32_t pte = caller->krnl->krnl_pgd[pgn];
-    if (PAGING_PAGE_PRESENT(pte)) {
-      MEMPHY_put_freefp(caller->krnl->mram, PAGING_FPN(pte));
-    }
-    caller->krnl->krnl_pgd[pgn] = 0;
+    uint32_t pte = (pgn < PAGING_MAX_PGN) ? caller->krnl->krnl_pgd[pgn] : 0;
 #endif
+    if (PAGING_PAGE_PRESENT(pte))
+      kmem_put_frame(caller, PAGING_FPN(pte));
+    kmem_unmap_page(caller, pgn);
   }
 
+  /* Give the virtual range back to the kernel vma for reuse by __kmalloc */
   struct vm_rg_struct *freerg_node = malloc(sizeof(struct vm_rg_struct));
-  freerg_node->rg_start = rgnode->rg_start;
-  freerg_node->rg_end = rgnode->rg_start + aligned_sz;
-  freerg_node->rg_next = NULL;
-  enlist_vm_freerg_list(caller->krnl->mm, freerg_node);
+  if (freerg_node != NULL) {
+    freerg_node->rg_start = rgnode->rg_start;
+    freerg_node->rg_end = rgnode->rg_start + aligned_sz;
+    freerg_node->rg_next = NULL;
+    if (enlist_vm_freerg_list(caller->krnl->mm, freerg_node) != 0)
+      free(freerg_node);
+  } else {
+    /* frames and PTEs are released; only this virtual range is lost */
+    printf("[kmem] WARNING: cannot record the freed kernel range\n");
+  }
 
   rgnode->rg_start = rgnode->rg_end = 0;
   rgnode->rg_next = NULL;
