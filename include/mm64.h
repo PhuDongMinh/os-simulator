@@ -30,9 +30,9 @@
  *       region starts at address 0 (libmem treats rg_start == 0 as "unset")
  *       and NULL dereferences fault.
  * Kernel: bottom of the canonical kernel half (VA bits 56..63 = 1).
- * Module 2/3 own the final layout and may change these values. */
-#define PAGING64_USER_VMA0_START   0x1000ULL
-#define PAGING64_KERNEL_VMA0_START 0xff00000000000000ULL
+ * The layout itself is defined once in common.h (USER/KERNEL_SPACE_*). */
+#define PAGING64_USER_VMA0_START   ((addr_t)USER_SPACE_START)
+#define PAGING64_KERNEL_VMA0_START ((addr_t)KERNEL_SPACE_START)
 #define PAGING64_PAGE_ALIGNSZ(sz) (DIV_ROUND_UP(sz,PAGING64_PAGESZ)*PAGING64_PAGESZ)
 
 

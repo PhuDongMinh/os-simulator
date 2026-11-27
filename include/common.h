@@ -3,10 +3,33 @@
 
 /* Define structs and routine could be used by every source files */
 
+/* Configuration must come first: the MM64 test below depends on it. */
 #include "os-cfg.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <pthread.h>
+
+#ifdef MM64
+#define USER_SPACE_START   0x0000000000001000ULL /* Bỏ trống __PAGEZERO 4KB (macOS-style) */
+#define USER_SPACE_END     0x00FFFFFFFFFFFFFFULL /* Nửa dưới 57-bit canonical */
+#define KERNEL_SPACE_START 0xFF00000000000000ULL /* Nửa trên 57-bit canonical */
+#define KERNEL_SPACE_END   0xFFFFFFFFFFFFFFFFULL
+
+#define OS_PAGESZ          PAGING64_PAGESZ       /* 4096 bytes */
+#define OS_PAGE_ALIGN(sz)  PAGING64_PAGE_ALIGNSZ(sz)
+#define OS_VADDR_PGN(addr) ((addr_t)(addr) >> PAGING64_ADDR_PT_SHIFT)
+#define OS_VADDR_OFF(addr) ((addr_t)(addr) & (PAGING64_PAGESZ - 1))
+#else
+#define USER_SPACE_START   0x00000100U
+#define USER_SPACE_END     0x003FFFFFU
+#define KERNEL_SPACE_START 0x80000000U
+#define KERNEL_SPACE_END   0xFFFFFFFFU
+
+#define OS_PAGESZ          PAGING_PAGESZ
+#define OS_PAGE_ALIGN(sz)  PAGING_PAGE_ALIGNSZ(sz)
+#define OS_VADDR_PGN(addr) PAGING_PGN(addr)
+#define OS_VADDR_OFF(addr) PAGING_OFFST(addr)
+#endif
 
 #ifndef OSMM_H
 #include "os-mm.h"
@@ -118,8 +141,7 @@ struct pcb_t
 	struct page_table_t *page_table; // Page table
 	uint32_t bp;			 // Break pointer
 
-	int kmap_rgid[10]; // Mảng lưu các rgid tiến trình đã xin từ Kernel
-    int num_kmaps;     // Số lượng vùng nhớ Kernel đang giữ
+	int kmap_slot[PAGING_MAX_SYMTBL_SZ];
 };
 
 /* Kernel structure */
@@ -144,8 +166,8 @@ struct krnl_t
 	struct kcache_pool_struct *kcpooltbl;
 	
 #ifdef MM64
-	/* Borrowed alias of mm->pgd; never allocate/free a second kernel root.
-	 * Establish the alias during kernel initialization (after Stage B0). */
+	/* Borrowed alias of mm->pgd; never allocate/free a second kernel root
+	 * (os.c: krnl_pgd = os.mm->pgd after init_mm(os.mm, NULL)). */
 	struct pt_pgd *krnl_pgd;
 	/* Legacy compatibility placeholders; keep NULL in MM64. */
 	addr_t *krnl_p4d;
