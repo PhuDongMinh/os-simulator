@@ -9,6 +9,11 @@
 #define PAGING64_CPU_BUS_WIDTH 57 /* Five 9-bit indices and a 12-bit offset */
 #define PAGING64_PAGESZ  4096      /* 4 KiB; 12 offset bits */
 
+#define PAGING64_USER_START ((addr_t)PAGING64_PAGESZ)
+#define PAGING64_USER_END   ((addr_t)(BIT_ULL(PAGING64_CPU_BUS_WIDTH - 1) - 1))
+#define PAGING64_KERNEL_START (~PAGING64_USER_END)
+#define PAGING64_KERNEL_END   UINT64_MAX
+
 #define GENMASK64(h, l) \
 	(((~0ULL) << (l)) & (~0ULL >> (MM64_BITS_PER_LONG  - (h) - 1)))
 
@@ -30,9 +35,10 @@
  *       region starts at address 0 (libmem treats rg_start == 0 as "unset")
  *       and NULL dereferences fault.
  * Kernel: bottom of the canonical kernel half (VA bits 56..63 = 1).
- * The layout itself is defined once in common.h (USER/KERNEL_SPACE_*). */
-#define PAGING64_USER_VMA0_START   ((addr_t)USER_SPACE_START)
-#define PAGING64_KERNEL_VMA0_START ((addr_t)KERNEL_SPACE_START)
+ * The 57-bit layout is defined once, by PAGING64_USER_* / PAGING64_KERNEL_*
+ * above; common.h derives USER_SPACE_* / KERNEL_SPACE_* from them. */
+#define PAGING64_USER_VMA0_START   PAGING64_USER_START
+#define PAGING64_KERNEL_VMA0_START PAGING64_KERNEL_START
 #define PAGING64_PAGE_ALIGNSZ(sz) (DIV_ROUND_UP(sz,PAGING64_PAGESZ)*PAGING64_PAGESZ)
 
 

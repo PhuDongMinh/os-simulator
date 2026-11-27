@@ -502,6 +502,8 @@ int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
  * Result on success (return 0):
  *   mm->pgd            empty five-level root (mm64_pgd_create)
  *   mm->mmap           vma0: vm_id 0, vm_start = vm_end = sbrk = base,
+ *                      vm_limit = PAGING64_USER_END (user) or
+ *                      PAGING64_KERNEL_END (kernel),
  *                      vm_mm = mm, vm_next = NULL, free list holding one
  *                      empty region [base, base)
  *   mm->symrgtbl       all regions zero (unallocated)
@@ -539,6 +541,8 @@ int init_mm(struct mm_struct *mm, struct pcb_t *caller)
   vma0->vm_start = base;
   vma0->vm_end = base;
   vma0->sbrk = base;
+  /* Last address the area may grow to: the end of its half */
+  vma0->vm_limit = (caller != NULL) ? PAGING64_USER_END : PAGING64_KERNEL_END;
   vma0->vm_freerg_list = NULL;
   enlist_vm_rg_node(&vma0->vm_freerg_list, first_rg);
   vma0->vm_next = NULL;

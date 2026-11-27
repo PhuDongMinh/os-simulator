@@ -81,7 +81,10 @@ struct vm_rg_struct {
 struct vm_area_struct {
    unsigned long vm_id;
    addr_t vm_start;
-   addr_t vm_end;
+   addr_t vm_end; /* Exclusive mapped end, or 0 after the last kernel page. */
+#ifdef MM64
+   addr_t vm_limit; /* Last virtual address allowed in the area. */
+#endif
 
    addr_t sbrk;
 /*

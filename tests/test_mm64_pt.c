@@ -501,6 +501,7 @@ static void test_init_mm_user(void)
 
    assert(init_mm(&mm, &owner) == 0);
    check_fresh_mm(&mm, PAGING64_USER_VMA0_START);
+   assert(mm.mmap->vm_limit == PAGING64_USER_END);
    assert(LIVE() == before + 3); /* root, vma0, first free region */
 
    /* the page table is usable immediately */
@@ -524,6 +525,17 @@ static void test_init_mm_kernel(void)
    memset(&kmm, 0, sizeof(kmm));
    assert(init_mm(&kmm, NULL) == 0); /* os.c: init_mm(os.mm, NULL) */
    check_fresh_mm(&kmm, PAGING64_KERNEL_VMA0_START);
+   assert(kmm.mmap->vm_limit == PAGING64_KERNEL_END);
+
+   /* the single 57-bit layout (mm64.h) and its common.h aliases */
+   assert(PAGING64_USER_START == 0x0000000000001000ULL);
+   assert(PAGING64_USER_END == 0x00FFFFFFFFFFFFFFULL);
+   assert(PAGING64_KERNEL_START == 0xFF00000000000000ULL);
+   assert(PAGING64_KERNEL_END == 0xFFFFFFFFFFFFFFFFULL);
+   assert(USER_SPACE_START == PAGING64_USER_START &&
+          USER_SPACE_END == PAGING64_USER_END &&
+          KERNEL_SPACE_START == PAGING64_KERNEL_START &&
+          KERNEL_SPACE_END == PAGING64_KERNEL_END);
 
    addr_t kpgn = PGN(PAGING64_KERNEL_VMA0_START);
    addr_t pgd, p4d, pud, pmd, pt;
