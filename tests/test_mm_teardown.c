@@ -127,6 +127,7 @@ static void test_release_everything(void)
   assert(count_fp(swp0.used_fp_list) == 0 && count_fp(swp0.free_fp_list) == 4);
   assert(count_fp(swp1.used_fp_list) == 0 && count_fp(swp1.free_fp_list) == 2);
   assert(mm.pgd == NULL && mm.mmap == NULL && mm.fifo_pgn == NULL);
+  assert(krnl.fifo_pgn == NULL);              /* global FIFO emptied */
   assert(mm.symrgtbl[3].rg_start == 0 && mm.symrgtbl[3].rg_end == 0);
 
   teardown();

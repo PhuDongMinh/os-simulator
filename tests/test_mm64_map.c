@@ -31,14 +31,14 @@ static int count_fp(struct framephy_struct *fp)
 static int fifo_len(void)
 {
   int n = 0;
-  for (struct pgn_t *p = mm.fifo_pgn; p != NULL; p = p->pg_next) n++;
+  for (struct pgn_t *p = krnl.fifo_pgn; p != NULL; p = p->pg_next) n++;
   return n;
 }
 
 /* FIFO page numbers, newest first */
 static void fifo_get(addr_t *out, int n)
 {
-  struct pgn_t *p = mm.fifo_pgn;
+  struct pgn_t *p = krnl.fifo_pgn;
   for (int i = 0; i < n; i++, p = p->pg_next) {
     assert(p != NULL);
     out[i] = p->pgn;
@@ -69,7 +69,7 @@ static void setup(int ram_frames, int swp_frames)
 
 static void teardown(void)
 {
-  struct pgn_t *p = mm.fifo_pgn;
+  struct pgn_t *p = krnl.fifo_pgn;
   while (p) { struct pgn_t *n = p->pg_next; free(p); p = n; }
   struct vm_area_struct *v = mm.mmap;
   while (v) {

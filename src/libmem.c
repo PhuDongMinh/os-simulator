@@ -271,11 +271,11 @@ static struct memphy_struct *swap_dev_of(struct krnl_t *krnl, addr_t typ);
  * Make page @pgn of the caller's user space resident and return its frame.
  * - PRESENT: nothing to do.
  * - SWAPPED: swap-in.  A free RAM frame is used if there is one; otherwise
- *   the oldest evictable page of the FIFO (mm64_fifo_victim: resident, not
- *   DMA-pinned) is copied to the active swap with syscall SYSMEM_SWP_OP,
- *   its PTE marked swapped, and its frame reused.  The target is then
- *   copied in from its own swap device, mapped, its swap slot released and
- *   it enters the FIFO.
+ *   the oldest evictable page of the global FIFO krnl->fifo_pgn (any
+ *   process; mm64_fifo_victim: resident, not DMA-pinned) is copied to the
+ *   active swap with syscall SYSMEM_SWP_OP, its owner's PTE marked swapped,
+ *   and its frame reused.  The target is then copied in from its own swap
+ *   device, mapped, its swap slot released and it enters the FIFO.
  * - Never mapped (PTE without PRESENT/SWAPPED, e.g. 0): -1, invalid access.
  * Kernel memory is never paged (its own path, __read/__write_kernel_mem):
  * any other mm is refused.  On failure the target page and the FIFO are
@@ -314,7 +314,7 @@ int pg_getpage(struct mm_struct *mm, addr_t pgn, int *fpn, struct pcb_t *caller)
   if (MEMPHY_get_freefp(ram, &tgtfpn) != 0) {
     /* RAM full: evict a victim to the active swap */
     addr_t vicfpn, swpfpn;
-    struct pgn_t **link = mm64_fifo_victim(mm, &vicfpn);
+    struct pgn_t **link = mm64_fifo_victim(&krnl->fifo_pgn, &vicfpn);
     if (link == NULL || krnl->active_mswp == NULL ||
         MEMPHY_get_freefp(krnl->active_mswp, &swpfpn) != 0)
       return -1;                                /* nothing changed */
@@ -329,10 +329,11 @@ int pg_getpage(struct mm_struct *mm, addr_t pgn, int *fpn, struct pcb_t *caller)
       return -1;                                /* victim still resident */
     }
 
-    /* Commit the victim: it now lives in swap, its frame is ours */
+    /* Commit the victim (maybe another process's page): it now lives in
+     * swap, its frame is ours */
     struct pgn_t *vic = *link;
     *link = vic->pg_next;
-    pte_set_swap(caller, vic->pgn, (int)krnl->active_mswp_id, swpfpn);
+    pte_set_swap_mm(vic->owner, vic->pgn, (int)krnl->active_mswp_id, swpfpn);
     free(vic);
     tgtfpn = vicfpn;
   }
@@ -345,7 +346,9 @@ int pg_getpage(struct mm_struct *mm, addr_t pgn, int *fpn, struct pcb_t *caller)
     return -1;
   }
   MEMPHY_put_freefp(src, srcoff);               /* swap slot is free again */
-  if (enlist_pgn_node(&mm->fifo_pgn, pgn) != 0)
+  if (enlist_pgn_node(&krnl->fifo_pgn, pgn) == 0)
+    krnl->fifo_pgn->owner = mm;
+  else
     printf("[mm] WARNING: page %llu is resident but not in the FIFO\n",
            (unsigned long long)pgn);
 
@@ -1606,7 +1609,9 @@ int free_pcb_memph(struct pcb_t *caller)
   mm64_pt_foreach(mm, release_page, &rc);
   mm64_pgd_destroy(mm);
 
-  /* 2. FIFO */
+  /* 2. FIFO: its pages leave the global list (and the legacy per-mm list,
+   * normally empty) */
+  mm64_fifo_drop(&caller->krnl->fifo_pgn, mm);
   while (mm->fifo_pgn != NULL) {
     struct pgn_t *next = mm->fifo_pgn->pg_next;
     free(mm->fifo_pgn);
@@ -1666,18 +1671,22 @@ int free_pcb_memph(struct pcb_t *caller)
  *@pgn: return page number
  *
  */
-int find_victim_page(struct mm_struct *mm, addr_t *retpgn)
+int find_victim_page(struct pcb_t *caller, struct mm_struct **vicmm, addr_t *retpgn)
 {
-  /* FIFO: the oldest page that can be evicted (resident, not pinned by
-   * the DMA), the same policy as alloc_pages_range and pg_getpage.
-   * Its node leaves the FIFO; the caller swaps the page out. */
+  /* Global FIFO: the oldest page of any process that can be evicted
+   * (resident, not pinned by the DMA), the same policy as
+   * alloc_pages_range and pg_getpage.  Its node leaves the FIFO; the
+   * caller swaps the page out of *vicmm.  Caller holds mmvm_lock. */
   addr_t vicfpn;
-  struct pgn_t **link = (retpgn != NULL) ? mm64_fifo_victim(mm, &vicfpn) : NULL;
+  if (caller == NULL || caller->krnl == NULL || vicmm == NULL || retpgn == NULL)
+    return -1;
+  struct pgn_t **link = mm64_fifo_victim(&caller->krnl->fifo_pgn, &vicfpn);
   if (link == NULL)
     return -1;
 
   struct pgn_t *vic = *link;
   *link = vic->pg_next;
+  *vicmm = vic->owner;
   *retpgn = vic->pgn;
   free(vic);
   return 0;

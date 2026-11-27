@@ -248,8 +248,8 @@ static void test_getpage_contract(void)
   assert(__read(&p, 0, 0, 5, &v) == -1);
   assert(pte_get_entry(&mm, PGN(UBASE), NULL) == pte_a);
   assert(pte_get_entry(&mm, PGN(UBASE + PG), NULL) == pte_b);
-  assert(mm.fifo_pgn != NULL && mm.fifo_pgn->pgn == PGN(UBASE + PG) &&
-         mm.fifo_pgn->pg_next == NULL);
+  assert(krnl.fifo_pgn != NULL && krnl.fifo_pgn->pgn == PGN(UBASE + PG) &&
+         krnl.fifo_pgn->owner == &mm && krnl.fifo_pgn->pg_next == NULL);
   assert(count_fp(swp0.free_fp_list) == 0 && count_fp(ram.free_fp_list) == 0);
 
   end_proc(&p);
@@ -289,25 +289,67 @@ static void test_swap_in_from_its_device(void)
   printf("PASS test_swap_in_from_its_device\n");
 }
 
-/* find_victim_page detaches the oldest evictable page */
+/* find_victim_page detaches the oldest evictable page of ANY process */
 static void test_find_victim_page(void)
 {
-  struct pcb_t p;
-  struct mm_struct mm;
+  struct pcb_t p1, p2;
+  struct mm_struct m1, m2, *vmm = NULL;
   addr_t a, vic = 0;
   setup(4, 0, 0);
-  new_proc(&p, &mm, 1);
+  new_proc(&p1, &m1, 1);
+  new_proc(&p2, &m2, 2);
 
-  assert(find_victim_page(&mm, &vic) == -1);         /* empty FIFO */
-  assert(__alloc(&p, 0, 0, 2 * PG, &a) == 0);        /* pages UBASE, +PG */
-  assert(find_victim_page(&mm, &vic) == 0 && vic == PGN(UBASE));
-  assert(mm.fifo_pgn != NULL && mm.fifo_pgn->pgn == PGN(UBASE + PG) &&
-         mm.fifo_pgn->pg_next == NULL);
-  assert(find_victim_page(&mm, NULL) == -1);
+  assert(find_victim_page(&p1, &vmm, &vic) == -1);   /* empty FIFO */
+  assert(__alloc(&p1, 0, 0, PG, &a) == 0);           /* oldest: p1's page */
+  assert(__alloc(&p2, 0, 0, PG, &a) == 0);
+  assert(find_victim_page(&p2, &vmm, &vic) == 0);    /* p2 asks ... */
+  assert(vmm == &m1 && vic == PGN(UBASE));           /* ... p1's page goes */
+  assert(krnl.fifo_pgn != NULL && krnl.fifo_pgn->owner == &m2 &&
+         krnl.fifo_pgn->pg_next == NULL);
+  assert(find_victim_page(&p1, NULL, &vic) == -1);
+  assert(find_victim_page(NULL, &vmm, &vic) == -1);
 
-  end_proc(&p);
+  end_proc(&p1);
+  end_proc(&p2);
   teardown();
   printf("PASS test_find_victim_page\n");
+}
+
+/* Global FIFO: with a single RAM frame, two processes take turns on it
+ * (each access swaps the other's page out) and both keep their data.
+ * With a per-process FIFO the second process could not get a frame. */
+static void test_processes_share_one_frame(void)
+{
+  struct pcb_t p1, p2;
+  struct mm_struct m1, m2;
+  addr_t a;
+  BYTE v = 0;
+  setup(1, 4, 0);
+  new_proc(&p1, &m1, 1);
+  new_proc(&p2, &m2, 2);
+
+  assert(__alloc(&p1, 0, 0, PG, &a) == 0);
+  assert(__write(&p1, 0, 0, 7, 0x11) == 0);
+  assert(__alloc(&p2, 0, 0, PG, &a) == 0);           /* evicts p1's page */
+  assert(pte_get_entry(&m1, PGN(UBASE), NULL) & PAGING_PTE_SWAPPED_MASK);
+  assert(__write(&p2, 0, 0, 7, 0x22) == 0);
+
+  for (int round = 0; round < 3; round++) {          /* ping-pong */
+    assert(__read(&p1, 0, 0, 7, &v) == 0 && v == 0x11);
+    assert(__read(&p2, 0, 0, 7, &v) == 0 && v == 0x22);
+  }
+  assert(count_fp(ram.free_fp_list) == 0 && count_fp(swp0.used_fp_list) == 1);
+
+  /* p1 ends: its node leaves the global FIFO, its swap slot is freed */
+  end_proc(&p1);
+  for (struct pgn_t *n = krnl.fifo_pgn; n != NULL; n = n->pg_next)
+    assert(n->owner == &m2);
+  assert(__read(&p2, 0, 0, 7, &v) == 0 && v == 0x22);
+  end_proc(&p2);
+  assert(krnl.fifo_pgn == NULL);
+  assert(count_fp(ram.used_fp_list) == 0 && count_fp(swp0.used_fp_list) == 0);
+  teardown();
+  printf("PASS test_processes_share_one_frame\n");
 }
 
 int main(void)
@@ -318,6 +360,7 @@ int main(void)
   test_getpage_contract();
   test_swap_in_from_its_device();
   test_find_victim_page();
+  test_processes_share_one_frame();
   printf("ALL SWAP TESTS PASSED\n");
   return 0;
 }

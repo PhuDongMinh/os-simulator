@@ -108,10 +108,19 @@ void mm64_pgd_destroy(struct mm_struct *mm);
 typedef void (*mm64_pte_visit_fn)(addr_t pgn, addr_t pte, void *ctx);
 int mm64_pt_foreach(struct mm_struct *mm, mm64_pte_visit_fn fn, void *ctx);
 
-/* Oldest evictable page of @mm's FIFO (resident, not DMA-pinned):
- * returns the link to its node (not detached) and its frame in *vicfpn,
- * or NULL when no page can be evicted.  Caller holds mmvm_lock. */
-struct pgn_t **mm64_fifo_victim(struct mm_struct *mm, addr_t *vicfpn);
+/* Oldest evictable page of the global FIFO @fifo (resident in its owner
+ * mm, not DMA-pinned): returns the link to its node (not detached; the
+ * node's owner is the victim mm) and its frame in *vicfpn, or NULL when
+ * no page can be evicted.  Caller holds mmvm_lock. */
+struct pgn_t **mm64_fifo_victim(struct pgn_t **fifo, addr_t *vicfpn);
+
+/* Mark @pgn of @mm as swapped out to frame @swpoff of swap device
+ * @swptyp (pte_set_swap uses caller->mm; eviction from the global FIFO
+ * needs the victim's own mm). */
+int pte_set_swap_mm(struct mm_struct *mm, addr_t pgn, int swptyp, addr_t swpoff);
+
+/* Remove every node of @mm from the global FIFO @fifo and free them. */
+void mm64_fifo_drop(struct pgn_t **fifo, struct mm_struct *mm);
 
 #ifdef __cplusplus
 }

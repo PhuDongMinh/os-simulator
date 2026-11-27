@@ -60,7 +60,10 @@ struct pt_leaf;
 
 struct pgn_t{
    addr_t pgn;
-   struct pgn_t *pg_next; 
+   struct pgn_t *pg_next;
+   /* Address space the page belongs to: the FIFO is global (krnl->fifo_pgn)
+    * and mixes the pages of every process. NULL for a list of one mm. */
+   struct mm_struct *owner;
 };
 
 /*

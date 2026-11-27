@@ -363,20 +363,27 @@ int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *call
 }
 
 /*
- * pte_set_swap - mark @pgn of caller->mm as swapped out
+ * pte_set_swap_mm - mark @pgn of @mm as swapped out
  * Result: PRESENT=0, SWAPPED=1, swap type=@swptyp (swap device id),
  * swap offset=@swpoff (frame inside that device).
- * Note: the legacy signature has no mm argument; the caller's own user
- * address space is used.
+ */
+int pte_set_swap_mm(struct mm_struct *mm, addr_t pgn, int swptyp, addr_t swpoff)
+{
+  addr_t val;
+  if (init_pte(&val, 0, 0, 0, 1, swptyp, swpoff) != 0)
+    return -1;
+  return pte_set_entry(mm, pgn, val, NULL);
+}
+
+/*
+ * pte_set_swap - legacy signature: the caller's own user address space.
+ * Eviction from the global FIFO uses pte_set_swap_mm on the victim's mm.
  */
 int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
 {
-  addr_t val;
   if (caller == NULL)
     return -1;
-  if (init_pte(&val, 0, 0, 0, 1, swptyp, swpoff) != 0)
-    return -1;
-  return pte_set_entry(caller->mm, pgn, val, caller);
+  return pte_set_swap_mm(caller->mm, pgn, swptyp, swpoff);
 }
 
 /*
@@ -385,15 +392,19 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
  *
  *  Ported from the huyendtn branch (HuyenDtn) onto the pt_pgd tree.
  *
- *  - All functions below work on caller->mm (the user address space).
+ *  - All functions below map into caller->mm (the user address space).
  *    Kernel memory has its own path (__kmalloc: contiguous frames, never
  *    in the FIFO).
- *  - The caller holds mmvm_lock: it protects mm->fifo_pgn, the vma list
+ *  - The caller holds mmvm_lock: it protects krnl->fifo_pgn, the vma list
  *    and the check-then-map sequence below.  pte_* take the tree lock and
  *    MEMPHY_* take memphy_lock (order mmvm_lock -> pgd->lock -> memphy).
- *  - FIFO: mm->fifo_pgn, newest page at the head, oldest at the tail.
- *    [OPEN] per-process FIFO, as on huyendtn; API_CONTRACT §7 still has
- *    to decide between per-process and global.
+ *    Every user-memory path (alloc, read, write, copy_*_user, process
+ *    exit) holds mmvm_lock, so touching another process's page table here
+ *    cannot race with that process.
+ *  - FIFO: one GLOBAL list, caller->krnl->fifo_pgn (API_CONTRACT §7):
+ *    newest page at the head, oldest at the tail, each node names its
+ *    owner mm.  When RAM is full the oldest evictable page of ANY process
+ *    is swapped out, so processes share a small RAM instead of failing.
  * ===================================================================
  */
 
@@ -450,8 +461,8 @@ static void free_pgn_list(struct pgn_t *pg)
 }
 
 /* Before any frame is taken: create the table paths, check that every
- * page is still unmapped and allocate its FIFO node (in *pending).
- * On failure nothing is kept but empty table nodes (harmless). */
+ * page is still unmapped and allocate its FIFO node (in *pending, owner
+ * @mm).  On failure nothing is kept but empty table nodes (harmless). */
 static int prepare_pages(struct mm_struct *mm, addr_t base_pgn, int pgnum,
                          struct pgn_t **pending)
 {
@@ -464,17 +475,18 @@ static int prepare_pages(struct mm_struct *mm, addr_t base_pgn, int pgnum,
       *pending = NULL;
       return -1;
     }
+    (*pending)->owner = mm;
   }
   return 0;
 }
 
-/* Write the PTEs of @pgnum prepared pages, then put them in the FIFO.
- * Paths exist and fpn come from the RAM device, so pte_set_fpn cannot
- * fail in practice; if it does, every PTE written here is cleared again
- * and -1 is returned (the caller still owns the frames). */
-static int map_prepared(struct mm_struct *mm, addr_t addr, int pgnum,
-                        struct framephy_struct *frames, struct pgn_t *pending,
-                        struct vm_rg_struct *ret_rg)
+/* Write the PTEs of @pgnum prepared pages, then put them in the global
+ * FIFO @fifo.  Paths exist and fpn come from the RAM device, so
+ * pte_set_fpn cannot fail in practice; if it does, every PTE written here
+ * is cleared again and -1 is returned (the caller still owns the frames). */
+static int map_prepared(struct mm_struct *mm, struct pgn_t **fifo, addr_t addr,
+                        int pgnum, struct framephy_struct *frames,
+                        struct pgn_t *pending, struct vm_rg_struct *ret_rg)
 {
   addr_t base_pgn = addr >> PAGING64_ADDR_PT_SHIFT;
   struct framephy_struct *fr = frames;
@@ -495,8 +507,8 @@ static int map_prepared(struct mm_struct *mm, addr_t addr, int pgnum,
     struct pgn_t *last = pending;
     while (last->pg_next != NULL)
       last = last->pg_next;
-    last->pg_next = mm->fifo_pgn;
-    mm->fifo_pgn = pending;
+    last->pg_next = *fifo;
+    *fifo = pending;
   }
 
   if (ret_rg != NULL) {
@@ -553,7 +565,8 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
                     struct framephy_struct *frames, // list of the mapped frames
                     struct vm_rg_struct *ret_rg)    // return mapped region, the real mapped fp
 {
-  if (caller == NULL || !range_in_vma(caller->mm, addr, pgnum))
+  if (caller == NULL || caller->krnl == NULL ||
+      !range_in_vma(caller->mm, addr, pgnum))
     return (addr_t)-1;
 
   int mapped = 0;
@@ -566,7 +579,8 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
                     &pending) != 0)
     return (addr_t)-1;
 
-  if (map_prepared(caller->mm, addr, mapped, frames, pending, ret_rg) != 0)
+  if (map_prepared(caller->mm, &caller->krnl->fifo_pgn, addr, mapped, frames,
+                   pending, ret_rg) != 0)
     return (addr_t)-1;
   return 0;
 }
@@ -578,20 +592,20 @@ struct pending_evict {
   struct pending_evict *next;
 };
 
-/* mm64_fifo_victim - oldest FIFO page of @mm that may be evicted: resident
- * and not pinned by the DMA.  *vicfpn receives its frame.  Return the link
- * that points to its node (NULL if none); the node is not detached.
+/* mm64_fifo_victim - oldest page of the global FIFO @fifo that may be
+ * evicted: resident in its owner mm and not pinned by the DMA.  *vicfpn
+ * receives its frame.  Return the link that points to its node (NULL if
+ * none); the node is not detached, node->owner is the victim's mm.
  * Shared by alloc_pages_range, find_victim_page and pg_getpage so that
  * every eviction follows the same policy.  Caller holds mmvm_lock. */
-struct pgn_t **mm64_fifo_victim(struct mm_struct *mm, addr_t *vicfpn)
+struct pgn_t **mm64_fifo_victim(struct pgn_t **fifo, addr_t *vicfpn)
 {
   struct pgn_t **pick = NULL;
 
-  if (mm == NULL || vicfpn == NULL)
+  if (fifo == NULL || vicfpn == NULL)
     return NULL;
-  for (struct pgn_t **link = &mm->fifo_pgn; *link != NULL;
-       link = &(*link)->pg_next) {
-    addr_t pte = pte_get_entry(mm, (*link)->pgn, NULL);
+  for (struct pgn_t **link = fifo; *link != NULL; link = &(*link)->pg_next) {
+    addr_t pte = pte_get_entry((*link)->owner, (*link)->pgn, NULL);
     if (PAGING_PAGE_PRESENT(pte) && !(pte & PAGING_PTE_SWAPPED_MASK) &&
         !frame_pinned(PAGING_FPN(pte))) {
       pick = link;
@@ -599,6 +613,23 @@ struct pgn_t **mm64_fifo_victim(struct mm_struct *mm, addr_t *vicfpn)
     }
   }
   return pick;
+}
+
+/* mm64_fifo_drop - a process ends: remove its pages from the global FIFO */
+void mm64_fifo_drop(struct pgn_t **fifo, struct mm_struct *mm)
+{
+  if (fifo == NULL)
+    return;
+  struct pgn_t **link = fifo;
+  while (*link != NULL) {
+    if ((*link)->owner == mm) {
+      struct pgn_t *gone = *link;
+      *link = gone->pg_next;
+      free(gone);
+    } else {
+      link = &(*link)->pg_next;
+    }
+  }
 }
 
 /*
@@ -609,9 +640,9 @@ struct pgn_t **mm64_fifo_victim(struct mm_struct *mm, addr_t *vicfpn)
  *              the list nodes; the frames themselves belong to caller->mm)
  *
  * Free RAM frames are used first.  When RAM is full, the oldest pages of
- * caller->mm's FIFO are copied to the active swap device and their frames
- * reused.  Victims are only committed (PTE -> swapped) once all frames are
- * secured, so a failure changes nothing.
+ * the global FIFO (any process) are copied to the active swap device and
+ * their frames reused.  Victims are only committed (PTE of their own mm ->
+ * swapped) once all frames are secured, so a failure changes nothing.
  * Return 0; (addr_t)-3000 when not enough frames can be obtained;
  * (addr_t)-1 for invalid arguments.
  */
@@ -625,6 +656,7 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
     return (addr_t)-1;
 
   struct mm_struct *mm = caller->mm;
+  struct pgn_t **fifo = &caller->krnl->fifo_pgn;
   struct memphy_struct *ram = caller->krnl->mram;
   struct memphy_struct *swp = caller->krnl->active_mswp;
   struct pending_evict *evicts = NULL;
@@ -641,9 +673,9 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
     if (evicts == NULL && MEMPHY_get_freefp(ram, &fpn) == 0) {
       from_free++;
     } else {
-      /* RAM is full: evict the oldest evictable page of this process */
+      /* RAM is full: evict the oldest evictable page of any process */
       struct pending_evict *ev = (swp != NULL) ? malloc(sizeof(*ev)) : NULL;
-      struct pgn_t **link = (ev != NULL) ? mm64_fifo_victim(mm, &fpn) : NULL;
+      struct pgn_t **link = (ev != NULL) ? mm64_fifo_victim(fifo, &fpn) : NULL;
       if (link == NULL || MEMPHY_get_freefp(swp, &ev->swpfpn) != 0) {
         free(ev);
         free(fr);
@@ -672,7 +704,7 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
   if (got < req_pgnum) {
     /* Victims still own their frames (RAM was only read): put them back
      * at the old end of the FIFO, oldest last, and release swap slots. */
-    struct pgn_t **end = &mm->fifo_pgn;
+    struct pgn_t **end = fifo;
     while (*end != NULL)
       end = &(*end)->pg_next;
     while (evicts != NULL) {
@@ -696,12 +728,12 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
     return (addr_t)-3000;
   }
 
-  /* Commit the evictions: victims now live in swap */
+  /* Commit the evictions: victims now live in swap (PTE of their owner) */
   while (evicts != NULL) {
     struct pending_evict *ev = evicts;
     evicts = ev->next;
-    pte_set_swap(caller, ev->victim->pgn, (int)caller->krnl->active_mswp_id,
-                 ev->swpfpn);
+    pte_set_swap_mm(ev->victim->owner, ev->victim->pgn,
+                    (int)caller->krnl->active_mswp_id, ev->swpfpn);
     free(ev->victim);
     free(ev);
   }
@@ -725,7 +757,7 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
 {
   struct framephy_struct *frm_lst = NULL;
 
-  if (caller == NULL || caller->mm == NULL ||
+  if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
       !range_in_vma(caller->mm, mapstart, incpgnum) ||
       mapstart < astart || mapstart > aend ||
       (addr_t)incpgnum > (aend - mapstart) / PAGING64_PAGESZ)
@@ -746,7 +778,8 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
   }
 
   /* 3. PTEs + FIFO */
-  int rc = map_prepared(caller->mm, mapstart, incpgnum, frm_lst, pending, ret_rg);
+  int rc = map_prepared(caller->mm, &caller->krnl->fifo_pgn, mapstart,
+                        incpgnum, frm_lst, pending, ret_rg);
 
   /* The list nodes are host bookkeeping only; on failure also return the
    * frames (an evicted victim already lives in swap, its frame is ours). */
@@ -882,6 +915,7 @@ int enlist_pgn_node(struct pgn_t **plist, addr_t pgn)
     return -1;
 
   pnode->pgn = pgn;
+  pnode->owner = NULL;          /* set by callers that use the global FIFO */
   pnode->pg_next = *plist;
   *plist = pnode;
 

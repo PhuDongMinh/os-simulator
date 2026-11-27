@@ -173,7 +173,13 @@ struct krnl_t
 	struct memphy_struct *active_mswp;
 	uint32_t active_mswp_id;
 	struct kcache_pool_struct *kcpooltbl;
-	
+
+	/* Global FIFO of resident-or-swapped USER pages of every process
+	 * (Module 1 page replacement): newest at the head, oldest at the tail,
+	 * each node names its owner mm. Kernel pages are never in it.
+	 * Protected by mmvm_lock (libmem.c). */
+	struct pgn_t *fifo_pgn;
+
 #ifdef MM64
 	/* Borrowed alias of mm->pgd; never allocate/free a second kernel root
 	 * (os.c: krnl_pgd = os.mm->pgd after init_mm(os.mm, NULL)). */

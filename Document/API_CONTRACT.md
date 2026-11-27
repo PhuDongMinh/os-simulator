@@ -171,14 +171,14 @@ flowchart LR
 | `init_mm(mm, caller)` ✅ | M4 (loader, kernel init) | `mm != NULL`, `mm->pgd == NULL` (vd. vừa `calloc`). `caller` **có thể NULL** (kernel mm). | `mm` được xóa sạch rồi có root, vma0 rỗng tại `PAGING64_USER_VMA0_START` (0x1000) hoặc `PAGING64_KERNEL_VMA0_START` (0xFF00…) khi `caller == NULL`, `vm_mm = mm`, symrgtbl = 0, `fifo_pgn = NULL`. Lỗi → `-1`, không leak. Vị trí cuối cùng do M2/M3 quyết định. |
 | `pte_get_entry(mm, pgn, caller)` ✅ | M1, M3 | — | Trả **giá trị** PTE; nhánh cây chưa có → `0` (không cấp phát). |
 | `pte_set_fpn(mm, pgn, fpn, caller)` ✅ | M1, M3 | `fpn` đang thuộc RAM, `fpn ≤ 65535` | Tạo node trung gian nếu thiếu; PTE = PRESENT, ¬SWAPPED, FPN. |
-| `pte_set_swap(caller, pgn, typ, off)` ✅ (dùng `caller->mm`) | M1 | — | PTE = ¬PRESENT, SWAPPED, typ = id thiết bị swap, off = fpn trong swap. **[ĐỀ XUẤT]** thêm tham số `mm`. |
+| `pte_set_swap(caller, pgn, typ, off)` ✅ (dùng `caller->mm`) / `pte_set_swap_mm(mm, pgn, typ, off)` ✅ | M1 | — | PTE = ¬PRESENT, SWAPPED, typ = id thiết bị swap, off = fpn trong swap. Bản `_mm` dùng khi victim thuộc tiến trình khác. |
 | `pte_clear_entry(mm, pgn, caller)` ✅ | M1, M3 (`__kfree`) | — | PTE = 0. Không trả frame (người gọi tự trả). |
 | `pte_set_entry(mm, pgn, val, caller)` ✅ | M1 | `val` vừa 32 bit | Ghi nguyên giá trị, từ chối nếu `val > UINT32_MAX`. |
 
 #### Mapping, swap, dịch địa chỉ ✅
 
 Người gọi giữ `mmvm_lock` (bảo vệ FIFO, danh sách vma và chuỗi "kiểm tra rồi map").
-FIFO hiện **riêng từng tiến trình** (`mm->fifo_pgn`, mới nhất ở đầu) — xem §7.
+FIFO **toàn cục**: `krnl->fifo_pgn` (mới nhất ở đầu), mỗi node ghi `owner` (mm của page). RAM đầy → page cũ nhất của **bất kỳ** tiến trình bị swap-out (§7).
 Test: `tests/run_mm64_map_tests.sh`, `run_swap_tests.sh`, `run_mm_teardown_tests.sh`.
 
 | Hàm | Ai gọi | Contract |
@@ -187,8 +187,8 @@ Test: `tests/run_mm64_map_tests.sh`, `run_swap_tests.sh`, `run_mm_teardown_tests
 | `alloc_pages_range(caller, n, &list)` ✅ | M1 nội bộ | Frame RAM trống trước; hết thì evict page cũ nhất của FIFO sang swap đang dùng (bỏ qua page bị DMA ghim). Victim chỉ được commit khi đủ `n` frame; không đủ → khôi phục victim + slot, trả `-3000`. |
 | `vmap_page_range(caller, addr, n, frames, &rg)` ✅ | M1 nội bộ | Map `min(n, số frame)` page theo danh sách frame; page phải chưa map. |
 | `pg_getpage(mm, pgn, &fpn, caller)` ✅ | M2 (`pg_getval/setval`) | `mm` phải là `caller->mm` (NULL = `caller->mm`); kernel mm → `-1`. PRESENT → trả `fpn`. SWAPPED → swap-in: frame trống trước, không có thì evict victim qua syscall `SYSMEM_SWP_OP`; đọc page từ **đúng thiết bị swap ghi trong PTE**, trả slot đó, đưa page vào FIFO. Chưa từng map → `-1`. Lỗi → page đích và FIFO không đổi. |
-| `find_victim_page(mm, &pgn)` ✅ | M1 | Page cũ nhất có thể evict (đang ở RAM, không bị DMA ghim); gỡ node khỏi FIFO. |
-| `mm64_fifo_victim(mm, &fpn)` ✅ | M1 nội bộ | Tiêu chí chọn victim dùng chung cho 3 hàm trên; không gỡ node. |
+| `find_victim_page(caller, &vicmm, &pgn)` ✅ | M1 | Page cũ nhất **toàn hệ thống** có thể evict (đang ở RAM, không bị DMA ghim); gỡ node khỏi FIFO, trả mm chủ (`vicmm`). |
+| `mm64_fifo_victim(&krnl->fifo_pgn, &fpn)` ✅ / `mm64_fifo_drop(&krnl->fifo_pgn, mm)` ✅ | M1 nội bộ | Tiêu chí chọn victim dùng chung cho 3 hàm trên (không gỡ node) / gỡ mọi node của một mm khi tiến trình kết thúc. |
 | `vmap_pgd_memset(caller, addr, n)` ✅ | M3 (`SYSMEM_MAP_OP`) | Ghi mẫu `0xdeadbeef` vào PTE của cả dải hoặc không page nào. |
 | `__swap_cp_page`, `__mm_swap_page` ✅ | M1, syscall `SYSMEM_SWP_OP` | Chép 1 frame giữa 2 thiết bị; trả `-1` nếu thiếu thiết bị / frame ngoài phạm vi. |
 | `free_pcb_memph(caller)` ✅ | M4 (khi tiến trình kết thúc) | Trả mọi frame RAM + slot SWAP (về đúng thiết bị) của `caller->mm`, giải phóng cây, FIFO, VMA, free-list. **Không** đụng kernel mm. `mm_struct` do `os.c` free. |
@@ -457,7 +457,7 @@ Page đang ở SWAP (PRESENT=0, SWAPPED=1) — không đổi so với spec
 
 - [ ] Thêm macro `PAGING64_PGN / PAGING64_OFFST / PAGING64_PHYADDR`; M2, M3 bỏ `PAGING_PGN`, `PAGE_SIZE` cũ.
 - [ ] Đổi kiểu trả về của `vm_map_ram` / `alloc_pages_range` sang `int`; `pg_getpage` dùng `addr_t`.
-- [ ] FIFO victim **theo tiến trình** hay **toàn cục** trong `krnl`. Hiện: theo tiến trình. M1 đề xuất **toàn cục**: với `os_1_mlq_paging_small_4K` (1 frame) tiến trình sau không evict được page của tiến trình trước nên `alloc` thất bại.
+- [x] FIFO victim **toàn cục** trong `krnl->fifo_pgn` (node có `owner`). Lý do: với `os_1_mlq_paging_small_4K` (1 frame), FIFO theo tiến trình làm tiến trình sau không evict được page của tiến trình trước nên `alloc` thất bại; FIFO toàn cục cho các tiến trình dùng chung RAM nhỏ qua swap. An toàn vì mọi đường bộ nhớ user giữ `mmvm_lock`. Hệ quả: page của một tiến trình có thể bị tiến trình khác swap-out (luôn swap-in lại qua `pg_getpage`); `krnl->mm->fifo_pgn` và `mm->fifo_pgn` không còn dùng.
 - [x] Vị trí và kích thước vma0 cùng layout kiểu macOS: user `[0x1000, 0x00FF…FF]`, kernel `[0xFF00…00, 0xFF…FF]`, giới hạn qua `vma->vm_limit`.
 - [x] Ghim frame cho DMA: đếm theo frame trong `libmem.c` (`dma_frame_pinned`), không dùng bit PTE.
 - [x] `os.c`: `os.krnl_pgd = os.mm->pgd` sau `init_mm(os.mm, NULL)` (Stage 2).
