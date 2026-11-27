@@ -95,7 +95,7 @@ int init_pte(addr_t *pte,
       CLRBIT(*pte, PAGING_PTE_SWAPPED_MASK);
       CLRBIT(*pte, PAGING_PTE_DIRTY_MASK);
 
-      SETVAL(*pte, fpn, PAGING_PTE_FPN_MASK, PAGING_PTE_FPN_LOBIT);
+      SETVAL(*pte, fpn, PAGING_PTE_FPN_MASK, PAGING_PTE_FPN_LOBIT); //
     }
     else
     { // page swapped
@@ -204,31 +204,9 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
  */
 int pte_set_fpn(struct mm_struct *mm, addr_t pgn, addr_t fpn, struct pcb_t *caller)
 {
-  struct krnl_t *krnl = caller->krnl;
-
-  addr_t *pte = NULL;
-  addr_t pgd=0;
-  addr_t p4d=0;
-  addr_t pud=0;
-  addr_t pmd=0;
-  addr_t pt=0;
-	
-  // dummy pte alloc to avoid runtime error
-  pte = malloc(sizeof(addr_t));
-#ifdef MM64	
-  /* Get value from the system */
-  /* TODO Perform multi-level page mapping */
-  get_pd_from_pagenum(pgn, &pgd, &p4d, &pud, &pmd, &pt);
-  //... krnl->mm->pgd
-  //... krnl->mm->pt
-  //pte = &krnl->mm->pt;
-  const addr_t index[] = {pgd, p4d, pud, pmd, pt};
-  pte = walk_page_tables(get_target_mm(mm, caller), pgn, index, 1);
+  addr_t *pte = lookup_pte(get_target_mm(mm, caller), pgn, 1);
   if (pte == NULL)
     return -1;
-#else
-  pte = &krnl->mm->pgd[pgn];
-#endif
 
   SETBIT(*pte, PAGING_PTE_PRESENT_MASK);
   CLRBIT(*pte, PAGING_PTE_SWAPPED_MASK);
@@ -322,11 +300,13 @@ int pte_set_entry(struct mm_struct *mm, addr_t pgn, uint64_t pte_val, struct pcb
 	return 0;
 }
 
-/* A mapping starts at a page boundary and has a representable exclusive end. */
-static int valid_page_range(addr_t addr, int pgnum)
+static int valid_page_range(struct mm_struct *mm, addr_t addr, int pgnum)
 {
+  const struct vm_area_struct *vma = mm->mmap;
+  const addr_t limit = vma == NULL ? UINT64_MAX : vma->vm_limit;
   return pgnum >= 0 && addr % PAGING64_PAGESZ == 0 &&
-         (addr_t)pgnum <= (UINT64_MAX - addr) / PAGING64_PAGESZ;
+         (vma == NULL || addr >= vma->vm_start) && addr <= limit &&
+         (pgnum == 0 || (addr_t)pgnum * PAGING64_PAGESZ - 1 <= limit - addr);
 }
 
 /*
@@ -343,7 +323,7 @@ int vmap_pgd_memset(struct pcb_t *caller,           // process call
    */
 
   struct mm_struct *mm = get_target_mm(NULL, caller);
-  if (mm == NULL || !valid_page_range(addr, pgnum))
+  if (mm == NULL || !valid_page_range(mm, addr, pgnum))
     return -1;
 
   addr_t base_pgn = addr >> PAGING64_ADDR_PT_SHIFT;
@@ -442,7 +422,7 @@ addr_t vmap_page_range(struct pcb_t *caller,           // process call
   //enlist_pgn_node(&caller->krnl->mm->fifo_pgn, pgn64 + pgit);
 
   struct mm_struct *mm = get_target_mm(NULL, caller);
-  if (mm == NULL || !valid_page_range(addr, pgnum))
+  if (mm == NULL || !valid_page_range(mm, addr, pgnum))
     return (addr_t)-1;
 
   int mapped = 0;
@@ -643,7 +623,7 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
    *duplicate control mechanism, keep it simple
    */
   struct mm_struct *mm = get_target_mm(NULL, caller);
-  if (mm == NULL || !valid_page_range(mapstart, incpgnum) ||
+  if (mm == NULL || !valid_page_range(mm, mapstart, incpgnum) ||
       mapstart < astart || mapstart > aend ||
       (addr_t)incpgnum > (aend - mapstart) / PAGING64_PAGESZ)
     return (addr_t)-1;
@@ -725,11 +705,10 @@ int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
 /*
  *Initialize a empty Memory Management instance
  * @mm:     self mm
- * @caller: mm owner
+ * @caller: process owning the user address space, or NULL for the kernel
  */
 int init_mm(struct mm_struct *mm, struct pcb_t *caller)
 {
-  (void)caller;
   if (mm == NULL)
     return -1;
 
@@ -753,7 +732,8 @@ int init_mm(struct mm_struct *mm, struct pcb_t *caller)
 
   /* By default the owner comes with at least one vma */
   vma0->vm_id = 0;
-  vma0->vm_start = 0;
+  vma0->vm_start = caller == NULL ? PAGING64_KERNEL_START : PAGING64_USER_START;
+  vma0->vm_limit = caller == NULL ? PAGING64_KERNEL_END : PAGING64_USER_END;
   vma0->vm_end = vma0->vm_start;
   vma0->sbrk = vma0->vm_start;
   struct vm_rg_struct *first_rg = init_vm_rg(vma0->vm_start, vma0->vm_end);

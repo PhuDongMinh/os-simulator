@@ -7,6 +7,11 @@
 #define PAGING64_CPU_BUS_WIDTH 57 /* 57 bit bus - MAX SPACE 4MB */
 #define PAGING64_PAGESZ  4096      /* 4KB or 12-bits PAGE NUMBER */
 
+#define PAGING64_USER_START ((addr_t)PAGING64_PAGESZ)
+#define PAGING64_USER_END   ((addr_t)(BIT_ULL(PAGING64_CPU_BUS_WIDTH - 1) - 1))
+#define PAGING64_KERNEL_START (~PAGING64_USER_END)
+#define PAGING64_KERNEL_END   UINT64_MAX
+
 #define GENMASK64(h, l) \
 	(((~0ULL) << (l)) & (~0ULL >> (MM64_BITS_PER_LONG  - (h) - 1)))
 
