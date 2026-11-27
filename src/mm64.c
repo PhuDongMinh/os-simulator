@@ -333,91 +333,326 @@ int pte_set_swap(struct pcb_t *caller, addr_t pgn, int swptyp, addr_t swpoff)
 }
 
 /*
- * vmap_pgd_memset - map a range of page at aligned address
+ * ===================================================================
+ *  Mapping of user pages to RAM (Module 1)
+ *
+ *  Ported from the huyendtn branch (HuyenDtn) onto the pt_pgd tree.
+ *
+ *  - All functions below work on caller->mm (the user address space).
+ *    Kernel memory has its own path (__kmalloc: contiguous frames, never
+ *    in the FIFO).
+ *  - The caller holds mmvm_lock: it protects mm->fifo_pgn, the vma list
+ *    and the check-then-map sequence below.  pte_* take the tree lock and
+ *    MEMPHY_* take memphy_lock (order mmvm_lock -> pgd->lock -> memphy).
+ *  - FIFO: mm->fifo_pgn, newest page at the head, oldest at the tail.
+ *    [OPEN] per-process FIFO, as on huyendtn; API_CONTRACT §7 still has
+ *    to decide between per-process and global.
+ * ===================================================================
+ */
+
+/* DMA pinning lives in libmem.c (M4).  Weak, so that mm64.c still links
+ * on its own (unit tests): then no frame is ever pinned. */
+extern int dma_frame_pinned(uint64_t fpn) __attribute__((weak));
+
+static int frame_pinned(addr_t fpn)
+{
+  return dma_frame_pinned != NULL && dma_frame_pinned(fpn);
+}
+
+/* Create the path to the PTE of @pgn (no entry is written).
+ * *is_free tells whether the entry is still 0 (never mapped).
+ * Return 0, or -1 for an invalid mm/pgn or an allocation failure. */
+static int pt_reserve(struct mm_struct *mm, addr_t pgn, int *is_free)
+{
+  struct pt_pgd *root = pt_root_for(mm, pgn);
+  if (root == NULL)
+    return -1;
+
+  pthread_mutex_lock(&root->lock);
+  mm_pte_t *pte = pt_walk_locked(root, pgn, 1);
+  if (pte != NULL)
+    *is_free = (*pte == 0);
+  pthread_mutex_unlock(&root->lock);
+
+  return (pte != NULL) ? 0 : -1;
+}
+
+/* Is [addr, addr + pgnum pages) page aligned and inside one vm area? */
+static int range_in_vma(struct mm_struct *mm, addr_t addr, int pgnum)
+{
+  if (mm == NULL || pgnum < 0 || addr % PAGING64_PAGESZ != 0)
+    return 0;
+
+  for (struct vm_area_struct *vma = mm->mmap; vma != NULL; vma = vma->vm_next) {
+    if (addr < vma->vm_start || addr > vma->vm_limit)
+      continue;
+    if (pgnum == 0 ||
+        (addr_t)pgnum * PAGING64_PAGESZ - 1 <= vma->vm_limit - addr)
+      return 1;
+  }
+  return 0;
+}
+
+static void free_pgn_list(struct pgn_t *pg)
+{
+  while (pg != NULL) {
+    struct pgn_t *next = pg->pg_next;
+    free(pg);
+    pg = next;
+  }
+}
+
+/* Before any frame is taken: create the table paths, check that every
+ * page is still unmapped and allocate its FIFO node (in *pending).
+ * On failure nothing is kept but empty table nodes (harmless). */
+static int prepare_pages(struct mm_struct *mm, addr_t base_pgn, int pgnum,
+                         struct pgn_t **pending)
+{
+  *pending = NULL;
+  for (int i = 0; i < pgnum; i++) {
+    int is_free = 0;
+    if (pt_reserve(mm, base_pgn + i, &is_free) != 0 || !is_free ||
+        enlist_pgn_node(pending, base_pgn + i) != 0) {
+      free_pgn_list(*pending);
+      *pending = NULL;
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* Write the PTEs of @pgnum prepared pages, then put them in the FIFO.
+ * Paths exist and fpn come from the RAM device, so pte_set_fpn cannot
+ * fail in practice; if it does, every PTE written here is cleared again
+ * and -1 is returned (the caller still owns the frames). */
+static int map_prepared(struct mm_struct *mm, addr_t addr, int pgnum,
+                        struct framephy_struct *frames, struct pgn_t *pending,
+                        struct vm_rg_struct *ret_rg)
+{
+  addr_t base_pgn = addr >> PAGING64_ADDR_PT_SHIFT;
+  struct framephy_struct *fr = frames;
+  int i;
+
+  for (i = 0; i < pgnum; i++, fr = fr->fp_next)
+    if (pte_set_fpn(mm, base_pgn + i, fr->fpn, NULL) != 0)
+      break;
+  if (i < pgnum) {
+    while (i-- > 0)
+      pte_clear_entry(mm, base_pgn + i, NULL);
+    free_pgn_list(pending);
+    return -1;
+  }
+
+  /* pending: newest page first; splice it in front of the FIFO */
+  if (pending != NULL) {
+    struct pgn_t *last = pending;
+    while (last->pg_next != NULL)
+      last = last->pg_next;
+    last->pg_next = mm->fifo_pgn;
+    mm->fifo_pgn = pending;
+  }
+
+  if (ret_rg != NULL) {
+    ret_rg->vmaid = 0;
+    ret_rg->rg_start = addr;
+    ret_rg->rg_end = addr + (addr_t)pgnum * PAGING64_PAGESZ;
+    ret_rg->rg_next = NULL;
+  }
+  return 0;
+}
+
+/*
+ * vmap_pgd_memset - fill the PTEs of a range with a debug pattern
+ * (sys_memmap SYSMEM_MAP_OP).  The range must lie in a vm area of
+ * caller->mm.  All paths are created first, so the pattern is written
+ * either on every page or on none.  Return 0 or -1.
  */
 int vmap_pgd_memset(struct pcb_t *caller,           // process call
                     addr_t addr,                       // start address which is aligned to pagesz
                     int pgnum)                      // num of mapping page
 {
-  //int pgit = 0;
-  //uint64_t pattern = 0xdeadbeef;
+  const uint64_t pattern = 0xdeadbeef;
 
-  /* TODO memset the page table with given pattern
-   */
+  if (caller == NULL || !range_in_vma(caller->mm, addr, pgnum))
+    return -1;
+
+  addr_t base_pgn = addr >> PAGING64_ADDR_PT_SHIFT;
+  for (int i = 0; i < pgnum; i++) {
+    int is_free;
+    if (pt_reserve(caller->mm, base_pgn + i, &is_free) != 0)
+      return -1;
+  }
+  for (int i = 0; i < pgnum; i++)
+    pte_set_entry(caller->mm, base_pgn + i, pattern, caller);
 
   return 0;
 }
 
 /*
  * vmap_page_range - map a range of page at aligned address
+ * @addr  : page-aligned start, inside a vm area of caller->mm
+ * @pgnum : number of pages wanted
+ * @frames: RAM frames to use, in order; only min(pgnum, list length)
+ *          pages are mapped ("no guarantee all given pages are mapped")
+ * @ret_rg: if not NULL, receives the region really mapped
+ *
+ * Every target page must be unmapped (PTE == 0).  Mapped pages enter the
+ * FIFO.  The frame list stays owned by the caller.
+ * Return 0, or (addr_t)-1 with nothing mapped.
  */
 addr_t vmap_page_range(struct pcb_t *caller,           // process call
                     addr_t addr,                       // start address which is aligned to pagesz // start
                     int pgnum,                      // num of mapping page
                     struct framephy_struct *frames, // list of the mapped frames
                     struct vm_rg_struct *ret_rg)    // return mapped region, the real mapped fp
-{                                                   // no guarantee all given pages are mapped
-//struct framephy_struct *fpit;
-//int pgit = 0;
-//addr_t pgn;
+{
+  if (caller == NULL || !range_in_vma(caller->mm, addr, pgnum))
+    return (addr_t)-1;
 
-  /* TODO: update the rg_end and rg_start of ret_rg 
-  //ret_rg->rg_end =  ....
-  //ret_rg->rg_start = ...
-  //ret_rg->vmaid = ...
-  */
+  int mapped = 0;
+  for (struct framephy_struct *fr = frames; fr != NULL && mapped < pgnum;
+       fr = fr->fp_next)
+    mapped++;
 
-  /* TODO map range of frame to address space
-   *      [addr to addr + pgnum*PAGING_PAGESZ
-   *      in page table caller->krnl->mm->pgd,
-   *                    caller->krnl->mm->pud...
-   *                    ...
-   */
+  struct pgn_t *pending = NULL;
+  if (prepare_pages(caller->mm, addr >> PAGING64_ADDR_PT_SHIFT, mapped,
+                    &pending) != 0)
+    return (addr_t)-1;
 
-  /* Tracking for later page replacement activities (if needed)
-   * Enqueue new usage page */
-  //enlist_pgn_node(&caller->krnl->mm->fifo_pgn, pgn64 + pgit);
-
+  if (map_prepared(caller->mm, addr, mapped, frames, pending, ret_rg) != 0)
+    return (addr_t)-1;
   return 0;
+}
+
+/* A page chosen for eviction, kept aside until every frame is secured */
+struct pending_evict {
+  struct pgn_t *victim;          /* its FIFO node, detached */
+  addr_t swpfpn;                 /* reserved slot in the active swap */
+  struct pending_evict *next;
+};
+
+/* Oldest FIFO page of @mm that may be evicted: resident and not pinned by
+ * the DMA.  Return the link that points to its node (NULL if none). */
+static struct pgn_t **fifo_pick_victim(struct mm_struct *mm, addr_t *vicfpn)
+{
+  struct pgn_t **pick = NULL;
+
+  for (struct pgn_t **link = &mm->fifo_pgn; *link != NULL;
+       link = &(*link)->pg_next) {
+    addr_t pte = pte_get_entry(mm, (*link)->pgn, NULL);
+    if (PAGING_PAGE_PRESENT(pte) && !(pte & PAGING_PTE_SWAPPED_MASK) &&
+        !frame_pinned(PAGING_FPN(pte))) {
+      pick = link;
+      *vicfpn = PAGING_FPN(pte);
+    }
+  }
+  return pick;
 }
 
 /*
  * alloc_pages_range - allocate req_pgnum of frame in ram
- * @caller    : caller
+ * @caller    : caller (caller->mm, caller->krnl->mram / active_mswp)
  * @req_pgnum : request page num
- * @frm_lst   : frame list
+ * @frm_lst   : receives a host list of req_pgnum frames (caller frees
+ *              the list nodes; the frames themselves belong to caller->mm)
+ *
+ * Free RAM frames are used first.  When RAM is full, the oldest pages of
+ * caller->mm's FIFO are copied to the active swap device and their frames
+ * reused.  Victims are only committed (PTE -> swapped) once all frames are
+ * secured, so a failure changes nothing.
+ * Return 0; (addr_t)-3000 when not enough frames can be obtained;
+ * (addr_t)-1 for invalid arguments.
  */
-
 addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_struct **frm_lst)
 {
-  //addr_t fpn;
-  //int pgit;
-  //struct framephy_struct *newfp_str = NULL;
-  //struct framephy_struct **cur = frm_lst;
+  if (frm_lst == NULL)
+    return (addr_t)-1;
+  *frm_lst = NULL;
+  if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
+      caller->krnl->mram == NULL || req_pgnum < 0)
+    return (addr_t)-1;
 
-  /* TODO: allocate the page 
-  //caller-> ...
-  //frm_lst-> ...
-  */
+  struct mm_struct *mm = caller->mm;
+  struct memphy_struct *ram = caller->krnl->mram;
+  struct memphy_struct *swp = caller->krnl->active_mswp;
+  struct pending_evict *evicts = NULL;
+  struct framephy_struct **tail = frm_lst;
+  int from_free = 0;   /* the first from_free frames came from free RAM */
+  int got;
 
+  for (got = 0; got < req_pgnum; got++) {
+    struct framephy_struct *fr = malloc(sizeof(*fr));
+    addr_t fpn = 0;
+    if (fr == NULL)
+      break;
 
-/*
-  for (pgit = 0; pgit < req_pgnum; pgit++)
-  {
-    // TODO: allocate the page 
-    if (MEMPHY_get_freefp(caller->mram, &fpn) == 0)
-    {
-      newfp_str->fpn = fpn;
+    if (evicts == NULL && MEMPHY_get_freefp(ram, &fpn) == 0) {
+      from_free++;
+    } else {
+      /* RAM is full: evict the oldest evictable page of this process */
+      struct pending_evict *ev = (swp != NULL) ? malloc(sizeof(*ev)) : NULL;
+      struct pgn_t **link = (ev != NULL) ? fifo_pick_victim(mm, &fpn) : NULL;
+      if (link == NULL || MEMPHY_get_freefp(swp, &ev->swpfpn) != 0) {
+        free(ev);
+        free(fr);
+        break;
+      }
+      if (__swap_cp_page(ram, fpn, swp, ev->swpfpn) != 0) {
+        MEMPHY_put_freefp(swp, ev->swpfpn);
+        free(ev);
+        free(fr);
+        break;
+      }
+      ev->victim = *link;            /* detach from the FIFO */
+      *link = ev->victim->pg_next;
+      ev->victim->pg_next = NULL;
+      ev->next = evicts;
+      evicts = ev;
     }
-    else
-    { // TODO: ERROR CODE of obtaining somes but not enough frames
-    }
+
+    fr->fpn = fpn;
+    fr->owner = mm;
+    fr->fp_next = NULL;
+    *tail = fr;
+    tail = &fr->fp_next;
   }
-*/
 
+  if (got < req_pgnum) {
+    /* Victims still own their frames (RAM was only read): put them back
+     * at the old end of the FIFO, oldest last, and release swap slots. */
+    struct pgn_t **end = &mm->fifo_pgn;
+    while (*end != NULL)
+      end = &(*end)->pg_next;
+    while (evicts != NULL) {
+      struct pending_evict *ev = evicts;
+      evicts = ev->next;
+      MEMPHY_put_freefp(swp, ev->swpfpn);
+      *end = ev->victim;
+      end = &ev->victim->pg_next;
+      free(ev);
+    }
+    /* Frames from free RAM go back; the evicted ones were never ours */
+    struct framephy_struct *fr = *frm_lst;
+    for (int i = 0; fr != NULL; i++) {
+      struct framephy_struct *next = fr->fp_next;
+      if (i < from_free)
+        MEMPHY_put_freefp(ram, fr->fpn);
+      free(fr);
+      fr = next;
+    }
+    *frm_lst = NULL;
+    return (addr_t)-3000;
+  }
 
-  /* End TODO */
-
+  /* Commit the evictions: victims now live in swap */
+  while (evicts != NULL) {
+    struct pending_evict *ev = evicts;
+    evicts = ev->next;
+    pte_set_swap(caller, ev->victim->pgn, (int)caller->krnl->active_mswp_id,
+                 ev->swpfpn);
+    free(ev->victim);
+    free(ev);
+  }
   return 0;
 }
 
@@ -425,39 +660,52 @@ addr_t alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_st
  * vm_map_ram - do the mapping all vm are to ram storage device
  * @caller    : caller
  * @astart    : vm area start
- * @aend      : vm area end
- * @mapstart  : start mapping point
- * @incpgnum  : number of mapped page
- * @ret_rg    : returned region
+ * @aend      : vm area end (exclusive)
+ * @mapstart  : start mapping point, page aligned, in [astart, aend)
+ * @incpgnum  : number of mapped page; mapstart + incpgnum pages <= aend
+ * @ret_rg    : returned region (may be NULL)
+ *
+ * All or nothing: on success every page is PRESENT and in the FIFO; on
+ * failure no PTE, frame, swap slot or FIFO entry has changed.
+ * Return 0 or (addr_t)-1.
  */
 addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapstart, int incpgnum, struct vm_rg_struct *ret_rg)
 {
   struct framephy_struct *frm_lst = NULL;
-  addr_t ret_alloc = 0;
 
-  /*@bksysnet: author provides a feasible solution of getting frames
-   *FATAL logic in here, wrong behaviour if we have not enough page
-   *i.e. we request 1000 frames meanwhile our RAM has size of 3 frames
-   *Don't try to perform that case in this simple work, it will result
-   *in endless procedure of swap-off to get frame and we have not provide
-   *duplicate control mechanism, keep it simple
-   */
-  ret_alloc = alloc_pages_range(caller, incpgnum, &frm_lst);
+  if (caller == NULL || caller->mm == NULL ||
+      !range_in_vma(caller->mm, mapstart, incpgnum) ||
+      mapstart < astart || mapstart > aend ||
+      (addr_t)incpgnum > (aend - mapstart) / PAGING64_PAGESZ)
+    return (addr_t)-1;
 
-  if (ret_alloc < 0 && ret_alloc != -3000)
-    return -1;
+  /* 1. Paths, "unmapped" check and FIFO nodes: cheap and reversible */
+  struct pgn_t *pending = NULL;
+  if (prepare_pages(caller->mm, mapstart >> PAGING64_ADDR_PT_SHIFT, incpgnum,
+                    &pending) != 0)
+    return (addr_t)-1;
 
-  /* Out of memory */
-  if (ret_alloc == -3000)
-  {
-    return -1;
+  /* 2. Frames (may evict to swap; changes nothing on failure).
+   * The original template warns about endless swapping when RAM is far too
+   * small: here a request that cannot be met simply fails. */
+  if (alloc_pages_range(caller, incpgnum, &frm_lst) != 0) {
+    free_pgn_list(pending);
+    return (addr_t)-1;
   }
 
-  /* it leaves the case of memory is enough but half in ram, half in swap
-   * do the swaping all to swapper to get the all in ram */
-   vmap_page_range(caller, mapstart, incpgnum, frm_lst, ret_rg);
+  /* 3. PTEs + FIFO */
+  int rc = map_prepared(caller->mm, mapstart, incpgnum, frm_lst, pending, ret_rg);
 
-  return 0;
+  /* The list nodes are host bookkeeping only; on failure also return the
+   * frames (an evicted victim already lives in swap, its frame is ours). */
+  while (frm_lst != NULL) {
+    struct framephy_struct *next = frm_lst->fp_next;
+    if (rc != 0)
+      MEMPHY_put_freefp(caller->krnl->mram, frm_lst->fpn);
+    free(frm_lst);
+    frm_lst = next;
+  }
+  return (rc == 0) ? 0 : (addr_t)-1;
 }
 
 /* Swap copy content page from source frame to destination frame
@@ -465,29 +713,21 @@ addr_t vm_map_ram(struct pcb_t *caller, addr_t astart, addr_t aend, addr_t mapst
  * @srcfpn : source physical page number (FPN)
  * @mpdst  : destination memphy
  * @dstfpn : destination physical page number (FPN)
+ * Return 0, or -1 if a device is missing or a frame is out of range
+ * (the destination may then be partially written).
  **/
 int __swap_cp_page(struct memphy_struct *mpsrc, addr_t srcfpn,
                    struct memphy_struct *mpdst, addr_t dstfpn)
 {
-  int cellidx;
-  addr_t addrsrc, addrdst;
-#ifdef MM64
-  for (cellidx = 0; cellidx < PAGING64_PAGESZ; cellidx++)
-  {
-    addrsrc = srcfpn * PAGING64_PAGESZ + cellidx;
-    addrdst = dstfpn * PAGING64_PAGESZ + cellidx;
-#else
-  for (cellidx = 0; cellidx < PAGING64_PAGESZ; cellidx++)
-  {
-    addrsrc = srcfpn * PAGING64_PAGESZ + cellidx;
-    addrdst = dstfpn * PAGING64_PAGESZ + cellidx;
-#endif
+  if (mpsrc == NULL || mpdst == NULL)
+    return -1;
 
+  for (addr_t off = 0; off < PAGING64_PAGESZ; off++) {
     BYTE data;
-    MEMPHY_read(mpsrc, addrsrc, &data);
-    MEMPHY_write(mpdst, addrdst, data);
+    if (MEMPHY_read(mpsrc, srcfpn * PAGING64_PAGESZ + off, &data) != 0 ||
+        MEMPHY_write(mpdst, dstfpn * PAGING64_PAGESZ + off, data) != 0)
+      return -1;
   }
-
   return 0;
 }
 
