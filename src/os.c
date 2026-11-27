@@ -516,6 +516,51 @@ static void *ld_routine(void *args)
 	pthread_exit(NULL);
 }
 
+#if defined(MM_PAGING) && !defined(MM_FIXED_MEMSZ)
+/* Memory used when a config file has no memory line (scheduler-only
+ * configs such as sched*, os_1_singleCPU_mlq): same sizes as the
+ * paging configs that run the same processes (os_1_singleCPU_mlq_paging). */
+#define CFG_DEFAULT_RAMSZ  1048576UL   /* 1 MiB  */
+#define CFG_DEFAULT_SWP0SZ 16777216UL  /* 16 MiB */
+
+/*
+ * read_memsz_line - read the optional memory line of a config file
+ *   MEM_RAM_SZ MEM_SWP0_SZ MEM_SWP1_SZ MEM_SWP2_SZ MEM_SWP3_SZ
+ * (size 0 = swap device not used).
+ * The line is recognised by its shape: exactly 5 unsigned numbers. A
+ * process line ("start_time path [prio]") has a non-numeric second token.
+ * Without a memory line the default sizes are used and the file position
+ * is restored, so the line is read again as the first process line.
+ */
+static void read_memsz_line(FILE *file)
+{
+	char line[256];
+	unsigned long sz[1 + PAGING_MAX_MMSWP];
+	char extra[2];
+	long pos = ftell(file);
+	int sit;
+
+	if (fgets(line, sizeof(line), file) != NULL &&
+	    sscanf(line, "%lu %lu %lu %lu %lu %1s", &sz[0], &sz[1], &sz[2],
+		   &sz[3], &sz[4], extra) == 1 + PAGING_MAX_MMSWP) {
+		memramsz = sz[0];
+		for (sit = 0; sit < PAGING_MAX_MMSWP; sit++)
+			memswpsz[sit] = sz[1 + sit];
+		return;
+	}
+
+	/* No memory line: defaults, and re-read this line as a process */
+	memramsz = CFG_DEFAULT_RAMSZ;
+	memswpsz[0] = CFG_DEFAULT_SWP0SZ;
+	for (sit = 1; sit < PAGING_MAX_MMSWP; sit++)
+		memswpsz[sit] = 0;
+	if (pos < 0 || fseek(file, pos, SEEK_SET) != 0) {
+		printf("Bad configure file: cannot re-read line 2\n");
+		exit(1);
+	}
+}
+#endif
+
 static void read_config(const char *path)
 {
 	FILE *file;
@@ -543,14 +588,9 @@ static void read_config(const char *path)
 	for (sit = 1; sit < PAGING_MAX_MMSWP; sit++)
 		memswpsz[sit] = 0;
 #else
-	/* MEM_RAM_SZ MEM_SWP0_SZ MEM_SWP1_SZ MEM_SWP2_SZ MEM_SWP3_SZ
-	 * (size = 0 means that swap device is not used) */
-	/* memramsz/memswpsz are unsigned long, so use %lu explicitly:
-	 * FORMAT_ARG is "%u" when MM64 is off and would write only 4 bytes */
-	fscanf(file, "%lu\n", &memramsz);
-	for (sit = 0; sit < PAGING_MAX_MMSWP; sit++)
-		fscanf(file, "%lu", &(memswpsz[sit]));
-	fscanf(file, "\n");
+	/* Optional memory line; scheduler-only configs have none */
+	(void)sit;
+	read_memsz_line(file);
 #endif
 #endif
 
