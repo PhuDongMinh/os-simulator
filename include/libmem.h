@@ -13,10 +13,6 @@
 
 #include "common.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #define SYSMEM_MAP_OP 1
 #define SYSMEM_INC_OP 2
 #define SYSMEM_SWP_OP 3
@@ -34,8 +30,6 @@ int libkmem_copy_from_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t
 int libkmem_copy_to_user(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 int libmem_dma_memcpy(struct pcb_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 
-#ifdef __cplusplus
-}
+int __kfree(struct pcb_t *caller, int vmaid, int rgid);
+int libkmem_free(struct pcb_t *caller, uint32_t reg_index);
 #endif
-
-#endif /* LIBMEM_H */

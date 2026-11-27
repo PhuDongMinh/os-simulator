@@ -12,6 +12,7 @@
 #include "timer.h"
 #include "sched.h"
 #include "loader.h"
+#include "libmem.h"
 #include "mm.h"
 #ifdef MM64
 #include "mm64.h"
@@ -96,15 +97,19 @@ static void *cpu_routine(void *args)
 					}
 				}
             	pthread_mutex_unlock((pthread_mutex_t *)proc->krnl->registry_lock);
-
-				for (int k = 0; k < proc->num_kmaps; k++) {
-					__kfree(proc, 0, proc->kmap_rgid[k]); 
+#ifdef MM_PAGING
+				/* Thu hồi các vùng nhớ Kernel thuộc tiến trình */
+				for (int k = 0; k < PAGING_MAX_SYMTBL_SZ; k++) {
+					if (proc->kmap_slot[k] != -1) __kfree(proc, 0, k);
 				}
 
 				/* Thu hồi user memory */
-				free_pcb_memph(proc); // Thu hồi toàn bộ frame trên RAM/SWAP của user
+#ifndef MM64
+				free_pcb_memph(proc); 
+#endif
 				if (proc->mm != NULL) free(proc->mm);   // Giải phóng cấu trúc mm_struct
 
+#endif
 				/* The process has finished its job */
 				printf("\tCPU %d: Processed %2d has finished\n",
 				       id, proc->pid);
@@ -206,21 +211,8 @@ static void *ld_routine(void *args)
 	while (i < num_processes) {
 		struct pcb_t *proc = load(ld_processes.path[i]);
 
-		/* Khởi tạo biến đếm kernel map */
-        proc->num_kmaps = 0;
-
-		/* sched.c uses proc->krnl, so this must always be set */
+		for (int k = 0; k < PAGING_MAX_SYMTBL_SZ; k++) proc->kmap_slot[k] = -1;
 		proc->krnl = &os;
-
-		/*Đăng ký tiến trình mới vào Kernel Registry*/
-		pthread_mutex_lock((pthread_mutex_t *)os.registry_lock);
-		for (int j = 0; j < MAX_PROCESS_REGISTRY; j++) {
-			if (os.proc_registry[j] == NULL) {
-				os.proc_registry[j] = proc;
-				break;
-			}
-		}
-		pthread_mutex_unlock((pthread_mutex_t *)os.registry_lock);
 
 #ifdef MLQ_SCHED
 		if (ld_processes.prio[i] >= MAX_PRIO) {
@@ -243,6 +235,16 @@ static void *ld_routine(void *args)
 			exit(1);
 		}
 #endif
+		/* Đăng ký tiến trình vào Kernel Registry sau khi đã khởi tạo xong mm */
+		pthread_mutex_lock((pthread_mutex_t *)os.registry_lock);
+		for (int j = 0; j < MAX_PROCESS_REGISTRY; j++) {
+			if (os.proc_registry[j] == NULL) {
+				os.proc_registry[j] = proc;
+				break;
+			}
+		}
+		pthread_mutex_unlock((pthread_mutex_t *)os.registry_lock);
+		
 #ifdef MLQ_SCHED
 		printf("\tLoaded a process at %s, PID: %d PRIO: %lu\n",
 		       ld_processes.path[i], proc->pid, ld_processes.prio[i]);

@@ -53,7 +53,7 @@ int enlist_vm_freerg_list(struct mm_struct *mm, struct vm_rg_struct *rg_elmt)
  */
 struct vm_rg_struct *get_symrg_byid(struct mm_struct *mm, int rgid)
 {
-  if (rgid < 0 || rgid > PAGING_MAX_SYMTBL_SZ)
+  if (rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
     return NULL;
 
   return &mm->symrgtbl[rgid];
@@ -135,7 +135,7 @@ int __free(struct pcb_t *caller, int vmaid, int rgid)
 {
   pthread_mutex_lock(&mmvm_lock);
 
-  if (rgid < 0 || rgid > PAGING_MAX_SYMTBL_SZ)
+  if (rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
   {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
@@ -330,29 +330,37 @@ int pg_setval(struct mm_struct *mm, int addr, BYTE value, struct pcb_t *caller)
  */
 int __read(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data)
 {
+  if (caller == NULL || caller->mm == NULL || data == NULL) return -1;
   /* TODO Invalid memory identify */
   pthread_mutex_lock(&mmvm_lock);
 
-  /* 1. NGĂN TRUY CẬP KERNEL: Bắt buộc lấy thông tin vùng nhớ từ caller->mm (User Space) */
+  /* 1. NGaN TRUY CẬP KERNEL: Bắt buộc lấy thông tin vùng nhớ từ caller->mm (User Space) */
   struct vm_rg_struct *currg = get_symrg_byid(caller->mm, rgid);
   struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
 
   /* 2. Kiểm tra tính hợp lệ (Tránh con trỏ rác hoặc vùng nhớ chưa cấp phát) */
-  if (currg == NULL || cur_vma == NULL || currg->rg_start == 0) {
+  if (currg == NULL || cur_vma == NULL || currg->rg_start == 0 || currg->rg_start >= currg->rg_end) {
     printf("[User Read] Lỗi Bảo Mật: Vùng nhớ (rgid=%d) không hợp lệ.\n", rgid);
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
 
-  /* 3. Kiểm tra tràn viền (Out-of-bounds) */
-  addr_t vaddr = currg->rg_start + offset;
-  if (vaddr >= currg->rg_end) {
+  /* 3. Kiểm tra tràn viền (Out-of-bounds) chống tràn số nguyen không dấu */
+  if (offset >= (currg->rg_end - currg->rg_start)) {
     printf("[User Read] Lỗi: Offset vượt quá giới hạn vùng nhớ.\n");
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
 
-  /* 4. Truy cập vật lý thông qua bảng phân trang của User (caller->mm) */
+  /* 4. Kiểm tra dải địa chỉ Canonical User Space (Chặn __PAGEZERO và Kernel Space) */
+  addr_t vaddr = currg->rg_start + offset;
+  if (vaddr < USER_SPACE_START || vaddr > USER_SPACE_END) {
+    printf("[User Read] Lỗi Bảo Mật: Địa chỉ ảo không thuộc User Space.\n");
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;
+  }
+
+  /* 5. Truy cập vật lý thông qua bảng phân trang của User (caller->mm) */
   int ret = pg_getval(caller->mm, vaddr, data, caller);
 
   pthread_mutex_unlock(&mmvm_lock);
@@ -391,28 +399,39 @@ printf("%s:%d\n",__func__,__LINE__);
  */
 int __write(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value)
 {
+  if (caller == NULL || caller->mm == NULL) return -1;
   pthread_mutex_lock(&mmvm_lock);
   
-  /* 1. NGĂN TRUY CẬP KERNEL: Bắt buộc lấy thông tin vùng nhớ từ caller->mm (User Space) */
+  /* 1. NGaN TRUY CẬP KERNEL: Bắt buộc lấy thông tin vùng nhớ từ caller->mm (User Space) */
   struct vm_rg_struct *currg = get_symrg_byid(caller->mm, rgid);
   struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
 
-  if (currg == NULL || cur_vma == NULL || currg->rg_start == 0) /* Invalid memory identify */
+  if (currg == NULL || cur_vma == NULL || currg->rg_start == 0 || currg->rg_start >= currg->rg_end) /* Invalid memory identify */
   {
     printf("[User Write] Lỗi Bảo Mật: Vùng nhớ (rgid=%d) không hợp lệ.\n", rgid);
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
 
-  /* 3. Kiểm tra tràn viền (Out-of-bounds) */
-  addr_t vaddr = currg->rg_start + offset;
-  if (vaddr >= currg->rg_end) {
+  /* 3. Kiểm tra tràn viền */
+  if (offset >= (currg->rg_end - currg->rg_start))
+  {
     printf("[User Write] Lỗi: Offset vượt quá giới hạn vùng nhớ.\n");
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
 
-  /* 4. Ghi vật lý thông qua bảng phân trang của User (caller->mm) */
+  addr_t vaddr = currg->rg_start + offset;
+
+  /* 4. Chốt chặn phân quyền: Cấm truy cập __PAGEZERO (< 0x1000) và Kernel Space (>= 0xFF00...) */
+  if (vaddr < USER_SPACE_START || vaddr > USER_SPACE_END)
+  {
+    printf("[User Write] Lỗi Bảo Mật: Địa chỉ 0x%lx nằm ngoài User Space.\n", (unsigned long)vaddr);
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;
+  }
+
+  /* 5. Ghi vật lý thông qua bảng phân trang của User (caller->mm) */
   int ret = pg_setval(caller->mm, vaddr, value, caller);
 
   pthread_mutex_unlock(&mmvm_lock);
@@ -441,17 +460,53 @@ int libwrite(
   return val;
 }
 
-/* Hàm hỗ trợ: Tìm và lấy N frame vật lý liên tục từ MEMPHY (RAM) */
-int MEMPHY_get_freefp_contig(struct memphy_struct *mp, int num_pages, int *ret_fpn)
-{
-  addr_t first;
-  if (ret_fpn == NULL) return -1;
+/* Hàm hỗ trợ: Tìm và lấy N frame vật lý lien tục từ MEMPHY (RAM) */
+int MEMPHY_get_freefp_contig(struct memphy_struct *mp, int num_pages, addr_t *ret_fpn) {
+  if (mp == NULL || ret_fpn == NULL || num_pages <= 0 || mp->free_fp_list == NULL) return -1;
+    
+  if (num_pages == 1) {
+    struct framephy_struct *fp = mp->free_fp_list;
+    *ret_fpn = fp->fpn;
+    mp->free_fp_list = fp->fp_next;
+    free(fp);
+    return 0;
+  }
 
-  /* Uses the same physical-memory lock and ownership lists as single-frame
-   * allocation. maxsz is int, so every valid FPN also fits in int. */
-  if (MEMPHY_get_freefp_range(mp, num_pages, &first) != 0) return -1;
-  *ret_fpn = (int)first;
-  return 0;
+  struct framephy_struct *curr = mp->free_fp_list;
+  struct framephy_struct *start_node = curr;
+  struct framephy_struct *start_prev = NULL;
+  int count = 1;
+    
+  while (curr != NULL && curr->fp_next != NULL) {
+    if (curr->fp_next->fpn == curr->fpn + 1) {
+      count++;
+      if (count == num_pages) {
+        *ret_fpn = start_node->fpn;
+        
+        /* Cắt dải node lien tục này ra khỏi danh sách free_fp_list */
+        struct framephy_struct *after_end = curr->fp_next->fp_next;
+        if (start_prev == NULL)
+          mp->free_fp_list = after_end;
+        else
+          start_prev->fp_next = after_end;
+                
+        /* Xóa các node đã lấy để tránh leak memory (nếu struct yeu cầu) */
+        struct framephy_struct *temp = start_node;
+        for (int i = 0; i < num_pages; i++) {
+          struct framephy_struct *next_temp = temp->fp_next;
+          free(temp);
+          temp = next_temp;
+        }
+        return 0; // Thành công
+      }
+    } else {
+      start_node = curr->fp_next;
+      start_prev = curr;
+      count = 1;
+    }
+    curr = curr->fp_next;
+  }
+  return -1; // Không đủ frame lien tục
 }
 
 /*libkmem_malloc- alloc region memory in kmem
@@ -485,6 +540,9 @@ int libkmem_malloc(struct pcb_t * caller, uint32_t size, uint32_t reg_index)
  */
 addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *alloc_addr)
 {
+  if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL ||
+      rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ || size == 0)
+    return -1;
   /* TODO: provide OS kernel memory allocation
    *       update krnl_pgd for OS kernel level management */
 
@@ -495,136 +553,140 @@ addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t 
   /* Bảo vệ vùng nhớ Kernel bằng khóa kmm_lock */
   pthread_mutex_lock(&kmm_lock);
 
-  int num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-  int start_fpn = -1;
-
-  // 1. Cấp phát Vật Lý Liên Tục
-  if (MEMPHY_get_freefp_contig(caller->krnl->mram, num_pages, &start_fpn) < 0) {
-    printf("[Kernel __kmalloc] Lỗi: Không đủ %d frame vật lý liên tục.\n", num_pages);
+  /* Khong cho ghi de rgid dang giu vung nho kernel */
+  if (caller->kmap_slot[rgid] != -1) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  // 2. Tìm Không gian Ảo trống trong os.mm (Kernel Space)
-  struct vm_area_struct *cur_vma = get_vma_by_num(caller->krnl->mm, vmaid);
-  struct vm_rg_struct *rgit = cur_vma->vm_freerg_list;
-  addr_t vaddr = -1;
+  /* 1. Tim slot trong trong os.mm->symrgtbl */
+  int kslot = -1;
+  for (int s = 0; s < PAGING_MAX_SYMTBL_SZ; s++) {
+    if (caller->krnl->mm->symrgtbl[s].rg_start == 0 &&
+        caller->krnl->mm->symrgtbl[s].rg_end == 0) {
+      kslot = s;
+      break;
+    }
+  }
+  if (kslot == -1) {
+    pthread_mutex_unlock(&kmm_lock);
+    return -1;
+  }
 
-  // Tìm vùng ảo vừa vặn (First-fit cơ bản cho Kernel)
+  /* 2. Cap phat vat ly lien tuc (can chinh theo OS_PAGESZ de tranh 2 vung chung page & toi uu DMA) */
+  addr_t aligned_sz = OS_PAGE_ALIGN(size);
+  int num_pages = (int)(aligned_sz / OS_PAGESZ);
+  addr_t start_fpn = 0;
+
+  if (MEMPHY_get_freefp_contig(caller->krnl->mram, num_pages, &start_fpn) < 0) {
+    pthread_mutex_unlock(&kmm_lock);
+    return -1;
+  }
+
+  /* 3. Tim vung nho ao trong trong os.mm (Kernel Space) */
+  struct vm_area_struct *cur_vma = get_vma_by_num(caller->krnl->mm, vmaid);
+  if (cur_vma == NULL) {
+    for (int i = 0; i < num_pages; i++)
+      MEMPHY_put_freefp(caller->krnl->mram, start_fpn + i);
+    pthread_mutex_unlock(&kmm_lock);
+    return -1;
+  }
+
+  struct vm_rg_struct *rgit = cur_vma->vm_freerg_list;
+  addr_t vaddr = 0;
+
   while (rgit != NULL) {
-    if (rgit->rg_start + size <= rgit->rg_end) {
-      vaddr = rgit->rg_start;
-      rgit->rg_start += size; // Thu hẹp khoảng trống
+    addr_t cand = OS_PAGE_ALIGN(rgit->rg_start);
+    if (cand >= KERNEL_SPACE_START && cand <= rgit->rg_end &&
+        (rgit->rg_end - cand) >= aligned_sz) {
+      vaddr = cand;
+      rgit->rg_start = cand + aligned_sz;
       break;
     }
     rgit = rgit->rg_next;
   }
 
-  if (vaddr == -1) {
-    printf("[Kernel __kmalloc] Lỗi: Hết không gian nhớ ảo cho Kernel.\n");
-    //Giải phóng lại start_fpn vào mram nếu cần xử lý lỗi chặt chẽ
+  if (vaddr == 0) {
+    for (int i = 0; i < num_pages; i++)
+      MEMPHY_put_freefp(caller->krnl->mram, start_fpn + i);
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  // Đăng ký vùng nhớ ảo mới vào Symbol Table của Kernel
-  caller->krnl->mm->symrgtbl[rgid].rg_start = vaddr;
-  caller->krnl->mm->symrgtbl[rgid].rg_end = vaddr + size;
-  *alloc_addr = vaddr;
-
-  // 3. Ánh xạ Địa chỉ Ảo -> Frame Vật Lý vào krnl_pgd
+  /* 4. Anh xa trang ao -> frame vat ly vao bang trang Kernel */
   for (int i = 0; i < num_pages; i++) {
-    int current_fpn = start_fpn + i;
-    addr_t current_vaddr = vaddr + i * PAGE_SIZE;
-    int pgn = PAGING_PGN(current_vaddr);
-
+    addr_t cur_fpn = start_fpn + i;
+    addr_t cur_vaddr = vaddr + (addr_t)i * OS_PAGESZ;
+    addr_t pgn = OS_VADDR_PGN(cur_vaddr);
 #ifdef MM64
-    // Hỗ trợ 64-bit Paging: Truyền trực tiếp mm của Kernel, PGN, FPN và caller
-    // Hàm pte_set_fpn sẽ tự động rẽ nhánh đa mức (Multi-level) bên trong
-    pte_set_fpn(caller->krnl->mm, pgn, current_fpn, caller);
+    pte_set_fpn(caller->krnl->mm, pgn, cur_fpn, caller);
 #else
-    // Hỗ trợ 32-bit Paging: Điền FPN và set cờ Present (bit 0 = 1)
-    uint32_t pte = (current_fpn << PAGING_PTE_FPN_LOBIT) | PAGING_PTE_PRESENT_MASK;
+    uint32_t pte = (cur_fpn << PAGING_PTE_FPN_LOBIT) | PAGING_PTE_PRESENT_MASK;
     caller->krnl->krnl_pgd[pgn] = pte;
 #endif
   }
 
-  printf("[Kernel __kmalloc] Thành công: Size = %d bytes, VAddr = %lu, Physical Start Frame = %d\n", size, vaddr, start_fpn);
-
-  /* Ghi nhận rgid vào danh sách quản lý của tiến trình */
-  if (caller->num_kmaps < 10) {
-      caller->kmap_rgid[caller->num_kmaps] = rgid;
-      caller->num_kmaps++;
-  }
+  /* 5. Luu gioi han that [vaddr, vaddr + size] de copy_from/to_user check bien chinh xac */
+  caller->krnl->mm->symrgtbl[kslot].rg_start = vaddr;
+  caller->krnl->mm->symrgtbl[kslot].rg_end = vaddr + size;
+  caller->kmap_slot[rgid] = kslot;
+  *alloc_addr = vaddr;
 
   pthread_mutex_unlock(&kmm_lock);
-  return 0; // 0 báo hiệu thành công
+  return 0;
 }
 
-/*__kfree - free region memory in kmem
- *@caller: caller
- *@vmaid: ID vm area to alloc memory region
- *@rgid: memory region ID (used to identify variable in symbol table)
- */
 int __kfree(struct pcb_t *caller, int vmaid, int rgid)
 {
+  if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL ||
+      rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
+    return -1;
+
   pthread_mutex_lock(&kmm_lock);
 
-  // 1. Xác thực ID vùng nhớ
-  if (rgid < 0 || rgid > PAGING_MAX_SYMTBL_SZ) {
+  int kslot = caller->kmap_slot[rgid];
+  if (kslot < 0 || kslot >= PAGING_MAX_SYMTBL_SZ) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  // 2. Lấy thông tin vùng nhớ từ Kernel Space
-  struct vm_rg_struct *rgnode = get_symrg_byid(caller->krnl->mm, rgid);
-  if (rgnode == NULL || (rgnode->rg_start == 0 && rgnode->rg_end == 0)) {
+  struct vm_rg_struct *rgnode = get_symrg_byid(caller->krnl->mm, kslot);
+  if (rgnode == NULL || rgnode->rg_start == 0 || rgnode->rg_start >= rgnode->rg_end) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  int num_pages = (rgnode->rg_end - rgnode->rg_start + PAGE_SIZE - 1) / PAGE_SIZE;
+  addr_t aligned_sz = OS_PAGE_ALIGN(rgnode->rg_end - rgnode->rg_start);
+  int num_pages = (int)(aligned_sz / OS_PAGESZ);
 
-  // 3. Thu hồi Frame Vật Lý và Xóa ánh xạ trong bảng phân trang Kernel
   for (int i = 0; i < num_pages; i++) {
-    addr_t vaddr = rgnode->rg_start + i * PAGE_SIZE;
-    int pgn = PAGING_PGN(vaddr);
-    int fpn;
-
+    addr_t vaddr = rgnode->rg_start + (addr_t)i * OS_PAGESZ;
+    addr_t pgn = OS_VADDR_PGN(vaddr);
 #ifdef MM64
-    // Trích xuất PTE 64-bit
     addr_t pte = pte_get_entry(caller->krnl->mm, pgn, caller);
     if (PAGING_PAGE_PRESENT(pte)) {
-      fpn = PAGING_FPN(pte);
-      MEMPHY_put_freefp(caller->krnl->mram, fpn); // Trả frame về RAM
-      
-      // XÓA PTE 64-BIT: Gọi hàm chuyên dụng để reset entry này
+      addr_t fpn = PAGING_FPN(pte);
+      MEMPHY_put_freefp(caller->krnl->mram, fpn);
       pte_clear_entry(caller->krnl->mm, pgn, caller);
     }
 #else
-    // Trích xuất và xóa PTE 32-bit
     uint32_t pte = caller->krnl->krnl_pgd[pgn];
     if (PAGING_PAGE_PRESENT(pte)) {
-      fpn = PAGING_FPN(pte);
-      MEMPHY_put_freefp(caller->krnl->mram, fpn); // Trả frame về RAM
+      MEMPHY_put_freefp(caller->krnl->mram, PAGING_FPN(pte));
     }
-    caller->krnl->krnl_pgd[pgn] = 0; // Xóa sạch ánh xạ để vùng nhớ thực sự "chết"
+    caller->krnl->krnl_pgd[pgn] = 0;
 #endif
   }
 
-  // 4. Trả lại không gian ảo (Virtual Region) cho Kernel mmap
   struct vm_rg_struct *freerg_node = malloc(sizeof(struct vm_rg_struct));
   freerg_node->rg_start = rgnode->rg_start;
-  freerg_node->rg_end = rgnode->rg_end;
+  freerg_node->rg_end = rgnode->rg_start + aligned_sz;
   freerg_node->rg_next = NULL;
-
   enlist_vm_freerg_list(caller->krnl->mm, freerg_node);
 
-  // 5. Xóa thông tin Symbol Table
   rgnode->rg_start = rgnode->rg_end = 0;
   rgnode->rg_next = NULL;
-
-  printf("[Kernel __kfree] Thành công: Đã thu hồi %d pages từ Kernel (rgid=%d).\n", num_pages, rgid);
+  caller->kmap_slot[rgid] = -1;
 
   pthread_mutex_unlock(&kmm_lock);
   return 0;
@@ -643,7 +705,7 @@ int libkmem_free(struct pcb_t *caller, uint32_t reg_index)
 
 // Chính sách xóa PTE 64-bit: 
       // Gọi hàm cấu hình PTE (nếu có) để xóa cờ PRESENT hoặc gán toàn bộ bit = 0
-      // Ví dụ: pte_set_fpn(caller->krnl->mm, pgn, 0, caller); // (Cần điều chỉnh bit PRESENT = 0 bên trong mm64.c)
+      // Ví dụ: pte_set_fpn(caller->krnl->mm, pgn, 0, caller); // (Cần điều chỉnh bit PRESENT = 0 ben trong mm64.c)
 
 /*libmem_dma_memcpy - DMA memcpy
  *@caller: caller
@@ -680,25 +742,40 @@ int libkmem_copy_from_user(struct pcb_t *caller, uint32_t source, uint32_t desti
   //__read_user_mem(...)
   //__write_kernel_mem(...);
 
-  if (caller == NULL || size == 0) return -1;
+  if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
+      caller->krnl->mm == NULL || size == 0)
+    return -1;
+
+  if (source >= PAGING_MAX_SYMTBL_SZ || destination >= PAGING_MAX_SYMTBL_SZ)
+    return -1;
 
   // 1. Lấy thông tin vùng nhớ Nguồn (User Space) và Đích (Kernel Space)
   struct vm_rg_struct *src_rg = get_symrg_byid(caller->mm, source);
-  struct vm_rg_struct *dst_rg = get_symrg_byid(caller->krnl->mm, destination);
+  int dst_kslot = caller->kmap_slot[destination];
+  struct vm_rg_struct *dst_rg = (dst_kslot >= 0) ? get_symrg_byid(caller->krnl->mm, dst_kslot) : NULL;
 
   // Kiểm tra sự tồn tại của vùng nhớ
-  if (src_rg == NULL || src_rg->rg_start == 0 || 
-      dst_rg == NULL || dst_rg->rg_start == 0) {
+  if (src_rg == NULL || src_rg->rg_start == 0 || src_rg->rg_start >= src_rg->rg_end ||
+      dst_rg == NULL || dst_rg->rg_start == 0 || dst_rg->rg_start >= dst_rg->rg_end) {
     printf("[Copy] Lỗi: Vùng nhớ Nguồn hoặc Đích chưa được cấp phát.\n");
-    return -1; 
+    return -1;
+  }
+
+  if (src_rg->rg_start < USER_SPACE_START || src_rg->rg_end - 1 > USER_SPACE_END ||
+      dst_rg->rg_start < KERNEL_SPACE_START || dst_rg->rg_end - 1 > KERNEL_SPACE_END) {
+    printf("[Copy] Lỗi Bảo Mật: Địa chỉ Nguồn/Đích không thuộc đúng không gian User/Kernel.\n");
+    return -1;
   }
 
   // Kiểm tra tràn viền (Out of bounds) trước khi thực sự copy
-  if (src_rg->rg_start + offset + size > src_rg->rg_end) {
+  addr_t src_len = src_rg->rg_end - src_rg->rg_start;
+  addr_t dst_len = dst_rg->rg_end - dst_rg->rg_start;
+
+  if (offset > src_len || size > src_len - offset) {
     printf("[Copy] Lỗi: Nguồn (User) không đủ dữ liệu theo size yêu cầu.\n");
     return -1;
   }
-  if (dst_rg->rg_start + offset + size > dst_rg->rg_end) {
+  if (offset > dst_len || size > dst_len - offset) {
     printf("[Copy] Lỗi: Đích (Kernel) không đủ sức chứa.\n");
     return -1;
   }
@@ -725,25 +802,40 @@ int libkmem_copy_to_user(struct pcb_t *caller, uint32_t source, uint32_t destina
   //__read_kernel_mem(...)
   //__write_user_mem(...);
 
-  if (caller == NULL || size == 0) return -1;
+  if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
+      caller->krnl->mm == NULL || size == 0)
+    return -1;
+
+  if (source >= PAGING_MAX_SYMTBL_SZ || destination >= PAGING_MAX_SYMTBL_SZ)
+    return -1;
 
   // 1. Lấy thông tin vùng nhớ Nguồn (Kernel Space) và Đích (User Space)
-  struct vm_rg_struct *src_rg = get_symrg_byid(caller->krnl->mm, source);
+  int src_kslot = caller->kmap_slot[source];
+  struct vm_rg_struct *src_rg = (src_kslot >= 0) ? get_symrg_byid(caller->krnl->mm, src_kslot) : NULL;
   struct vm_rg_struct *dst_rg = get_symrg_byid(caller->mm, destination);
 
   // Kiểm tra sự tồn tại
-  if (src_rg == NULL || src_rg->rg_start == 0 || 
-      dst_rg == NULL || dst_rg->rg_start == 0) {
+  if (src_rg == NULL || src_rg->rg_start == 0 || src_rg->rg_start >= src_rg->rg_end ||
+      dst_rg == NULL || dst_rg->rg_start == 0 || dst_rg->rg_start >= dst_rg->rg_end) {
     printf("[Copy] Lỗi: Vùng nhớ Nguồn hoặc Đích chưa được cấp phát.\n");
     return -1;
   }
 
+  if (src_rg->rg_start < KERNEL_SPACE_START || src_rg->rg_end - 1 > KERNEL_SPACE_END ||
+      dst_rg->rg_start < USER_SPACE_START || dst_rg->rg_end - 1 > USER_SPACE_END) {
+    printf("[Copy] Lỗi Bảo Mật: Địa chỉ Nguồn/Đích không thuộc đúng không gian Kernel/User.\n");
+    return -1;
+  }
+
   // Kiểm tra tràn viền 
-  if (src_rg->rg_start + offset + size > src_rg->rg_end) {
+  addr_t src_len = src_rg->rg_end - src_rg->rg_start;
+  addr_t dst_len = dst_rg->rg_end - dst_rg->rg_start;
+
+  if (offset > src_len || size > src_len - offset) {
     printf("[Copy] Lỗi: Nguồn (Kernel) không đủ dữ liệu theo size yêu cầu.\n");
     return -1;
   }
-  if (dst_rg->rg_start + offset + size > dst_rg->rg_end) {
+  if (offset > dst_len || size > dst_len - offset) {
     printf("[Copy] Lỗi: Đích (User) không đủ sức chứa.\n");
     return -1;
   }
@@ -771,50 +863,62 @@ int libkmem_copy_to_user(struct pcb_t *caller, uint32_t source, uint32_t destina
  */
 int __read_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data)
 {
+  if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL ||
+      data == NULL || rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ) 
+    return -1;
+
   /* TODO: provide OS memory operator for kernel memory region */
   //krnl->krnl_pgd ... or krnl->pgd ... based on kmem implementation strategy
   pthread_mutex_lock(&kmm_lock);
   
-  // 1. Tìm vùng nhớ ảo Kernel
-  struct vm_rg_struct *currg = get_symrg_byid(caller->krnl->mm, rgid);
-  if (currg == NULL || currg->rg_start == 0) {
+  // 1. TTim vung nho ao Kernel
+  int kslot = caller->kmap_slot[rgid];
+  if (kslot < 0 || kslot >= PAGING_MAX_SYMTBL_SZ) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
-  // 2. Tính địa chỉ ảo và trích xuất Page Number (PGN), Offset
-  addr_t vaddr = currg->rg_start + offset;
-  if (vaddr >= currg->rg_end) {
+  struct vm_rg_struct *currg = get_symrg_byid(caller->krnl->mm, kslot);
+  if (currg == NULL || currg->rg_start == 0 || currg->rg_start >= currg->rg_end) {
     pthread_mutex_unlock(&kmm_lock);
-    return -1; // Lỗi: Truy cập ngoài vùng cấp phát
+    return -1;
   }
 
-  int pgn = PAGING_PGN(vaddr);
-  int off = vaddr % PAGE_SIZE;
-  int fpn;
+  // 2. Kiem tra bien va trich xuat Page Number, Offset
+  if (offset >= (currg->rg_end - currg->rg_start)) {
+    pthread_mutex_unlock(&kmm_lock);
+    return -1; 
+  }
 
-  // 3. Dịch Virtual Address -> Physical Address từ bảng phân trang Kernel
+  addr_t vaddr = currg->rg_start + offset;
+  if (vaddr < KERNEL_SPACE_START) {
+    pthread_mutex_unlock(&kmm_lock);
+    return -1; //Dia chi khong nam trong khong gian kernel
+  }
+
+  addr_t pgn = OS_VADDR_PGN(vaddr);
+  addr_t off = OS_VADDR_OFF(vaddr);
+  addr_t fpn;
+
+  // 3. Dich Virtual Address -> Physical Address tu bang phan trang Kernel
 #ifdef MM64
-  // Trích xuất PTE 64-bit bằng cách duyệt qua bảng phân trang của Kerne
   addr_t pte = pte_get_entry(caller->krnl->mm, pgn, caller);
   if (!PAGING_PAGE_PRESENT(pte)) {
-    // Vùng nhớ Kernel luôn phải nằm trên RAM (được cấp phát cứng qua __kmalloc)
-    // Nếu không có mặt (Present = 0), đây là lỗi truy cập bộ nhớ nghiêm trọng
     pthread_mutex_unlock(&kmm_lock);
-    return -1; // Page của Kernel luôn phải nằm trên RAM, không được swap
+    return -1; 
   }
-  fpn = PAGING_FPN(pte); // Lấy Frame Number từ 64-bit PTE
+  fpn = PAGING_FPN(pte); 
 #else
   uint32_t pte = caller->krnl->krnl_pgd[pgn];
-  if (!PAGING_PAGE_PRESENT(pte)) { // Page của Kernel luôn phải nằm trên RAM
+  if (!PAGING_PAGE_PRESENT(pte)) { 
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
   fpn = PAGING_FPN(pte);
 #endif
 
-  // 4. Truy xuất vào RAM vật lý
-  addr_t phyaddr = (fpn * PAGE_SIZE) + off;
+  // 4. Truy xuat vao RAM vat ly
+  addr_t phyaddr = (fpn * OS_PAGESZ) + off;
   int ret = MEMPHY_read(caller->krnl->mram, phyaddr, data);
 
   pthread_mutex_unlock(&kmm_lock);
@@ -831,27 +935,42 @@ int __read_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, 
 int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value)
 {
   /* TODO: provide OS memory operator for kernel memory region */
-  //krnl->krnl_pgd ... or krnl->pgd ... based on kmem implementation strategy
+  // krnl->krnl_pgd ... or krnl->pgd ... based on kmem implementation strategy
+  if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL ||
+      rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
+    return -1;
+
   pthread_mutex_lock(&kmm_lock);
-  
-  struct vm_rg_struct *currg = get_symrg_byid(caller->krnl->mm, rgid);
-  if (currg == NULL || currg->rg_start == 0) {
+
+  int kslot = caller->kmap_slot[rgid];
+  if (kslot < 0 || kslot >= PAGING_MAX_SYMTBL_SZ) {
+    pthread_mutex_unlock(&kmm_lock);
+    return -1;
+  }
+
+  struct vm_rg_struct *currg = get_symrg_byid(caller->krnl->mm, kslot);
+  if (currg == NULL || currg->rg_start == 0 || currg->rg_start >= currg->rg_end) {
+    pthread_mutex_unlock(&kmm_lock);
+    return -1;
+  }
+
+  if (offset >= currg->rg_end - currg->rg_start) {
     pthread_mutex_unlock(&kmm_lock);
     return -1;
   }
 
   addr_t vaddr = currg->rg_start + offset;
-  if (vaddr >= currg->rg_end) {
+  if (vaddr < KERNEL_SPACE_START || vaddr > KERNEL_SPACE_END) {
     pthread_mutex_unlock(&kmm_lock);
-    return -1; 
+    return -1;
   }
 
-  int pgn = PAGING_PGN(vaddr);
-  int off = vaddr % PAGE_SIZE;
-  int fpn;
+  addr_t pgn = OS_VADDR_PGN(vaddr);
+  addr_t off = OS_VADDR_OFF(vaddr);
+  addr_t fpn;
 
 #ifdef MM64
-  // Trích xuất PTE 64-bit bằng cách duyệt qua bảng phân trang của Kerne
+  // Trích xuất PTE 64-bit bằng cách duyệt qua bảng phân trang của Kernel
   addr_t pte = pte_get_entry(caller->krnl->mm, pgn, caller);
   if (!PAGING_PAGE_PRESENT(pte)) {
     // Vùng nhớ Kernel luôn phải nằm trên RAM (được cấp phát cứng qua __kmalloc)
@@ -859,7 +978,7 @@ int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset,
     pthread_mutex_unlock(&kmm_lock);
     return -1; // Page của Kernel luôn phải nằm trên RAM, không được swap
   }
-  fpn = PAGING_FPN(pte); // Lấy Frame Number từ 64-bit PTE
+  fpn = PAGING_FPN(pte); // Lấy Frame Number từ 64-bit PTE (tự khớp FPN 16-bit)
 #else
   uint32_t pte = caller->krnl->krnl_pgd[pgn];
   if (!PAGING_PAGE_PRESENT(pte)) {
@@ -869,7 +988,7 @@ int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset,
   fpn = PAGING_FPN(pte);
 #endif
 
-  addr_t phyaddr = (fpn * PAGE_SIZE) + off;
+  addr_t phyaddr = (fpn * OS_PAGESZ) + off;
   int ret = MEMPHY_write(caller->krnl->mram, phyaddr, value);
 
   pthread_mutex_unlock(&kmm_lock);
@@ -887,17 +1006,28 @@ int __read_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BY
 {
   /* TODO: provide OS level management user memory access */
   //krnl->pgd ... or krnl->krnl_pgd  ... based on kmem implementation strategy
+  if (caller == NULL || caller->mm == NULL || data == NULL ||
+      rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
+    return -1;
+
   pthread_mutex_lock(&mmvm_lock);
   
   // Trỏ về không gian mm của tiến trình User
   struct vm_rg_struct *currg = get_symrg_byid(caller->mm, rgid);
-  if (currg == NULL || currg->rg_start == 0) {
+  if (currg == NULL || currg->rg_start == 0 || currg->rg_start >= currg->rg_end) {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
 
+  // Kiểm tra biên chống tràn số nguyên không dấu
+  if (offset >= (currg->rg_end - currg->rg_start)) {
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;
+  }
+
+  // Kiểm tra dải địa chỉ Canonical User Space (Chặn __PAGEZERO và Kernel Space)
   addr_t vaddr = currg->rg_start + offset;
-  if (vaddr >= currg->rg_end) {
+  if (vaddr < USER_SPACE_START || vaddr > USER_SPACE_END) {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
@@ -909,7 +1039,6 @@ int __read_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BY
   return ret;
 }
 
-
 /*__write_user_mem - write a user region memory
  *@caller: caller
  *@vmaid: ID vm area to alloc memory region
@@ -919,18 +1048,29 @@ int __read_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BY
  */
 int __write_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value)
 {
+  if (caller == NULL || caller->mm == NULL)
+    return -1;
+
   /* TODO: provide OS level management user memory access */
   //krnl->pgd ... or krnl->krnl_pgd  ... based on kmem implementation strategy
   pthread_mutex_lock(&mmvm_lock);
-  
+
   struct vm_rg_struct *currg = get_symrg_byid(caller->mm, rgid);
-  if (currg == NULL || currg->rg_start == 0) {
+  if (currg == NULL || currg->rg_start == 0 || currg->rg_start >= currg->rg_end) {
+    pthread_mutex_unlock(&mmvm_lock);
+    return -1;
+  }
+
+  /* Kiểm tra tràn viền chống tràn số nguyên không dấu */
+  if (offset >= (currg->rg_end - currg->rg_start)) {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
 
   addr_t vaddr = currg->rg_start + offset;
-  if (vaddr >= currg->rg_end) {
+
+  /* Chốt chặn dải địa chỉ Canonical User Space (chặn __PAGEZERO và Kernel Space) */
+  if (vaddr < USER_SPACE_START || vaddr > USER_SPACE_END) {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
   }
