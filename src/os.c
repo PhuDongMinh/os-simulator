@@ -361,14 +361,8 @@ static void *cpu_routine(void *args)
 
 				/* 4. User memory, then the mm itself */
 				if (proc->mm != NULL) {
-#ifdef MM64
-					/* TODO(M1): free_pcb_memph() for MM64 must return the
-					 * RAM frames and swap slots first; until then they leak.
-					 * Only the page-table tree is released here. */
-					mm64_pgd_destroy(proc->mm);
-#else
+					/* frames, swap slots, page table, FIFO, vm areas */
 					free_pcb_memph(proc);
-#endif
 					free(proc->mm);
 					proc->mm = NULL;
 				}

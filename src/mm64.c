@@ -182,6 +182,53 @@ void mm64_pgd_destroy(struct mm_struct *mm)
 }
 
 /*
+ * mm64_pt_foreach - call @fn(pgn, pte, ctx) for every non-zero PTE of @mm
+ * (see mm64.h).  Never allocates.
+ */
+int mm64_pt_foreach(struct mm_struct *mm, mm64_pte_visit_fn fn, void *ctx)
+{
+  if (mm == NULL || mm->pgd == NULL || fn == NULL)
+    return -1;
+
+  const unsigned int sh = PAGING64_PT_INDEX_BITS;
+  struct pt_pgd *root = mm->pgd;
+
+  pthread_mutex_lock(&root->lock);
+  for (addr_t i5 = 0; i5 < PAGING64_PT_ENTRIES; ++i5) {
+    struct pt_p4d *p4d = root->child[i5];
+    if (p4d == NULL)
+      continue;
+    /* PGD 256..511 is the kernel half: sign-extend VA bit 56 */
+    addr_t high = (i5 >= PAGING64_PT_ENTRIES / 2)
+                      ? (PT_PGN_HIGH_KERNEL << PT_PGN_SIGN_BIT) : 0;
+    for (addr_t i4 = 0; i4 < PAGING64_PT_ENTRIES; ++i4) {
+      struct pt_pud *pud = p4d->child[i4];
+      if (pud == NULL)
+        continue;
+      for (addr_t i3 = 0; i3 < PAGING64_PT_ENTRIES; ++i3) {
+        struct pt_pmd *pmd = pud->child[i3];
+        if (pmd == NULL)
+          continue;
+        for (addr_t i2 = 0; i2 < PAGING64_PT_ENTRIES; ++i2) {
+          struct pt_leaf *leaf = pmd->child[i2];
+          if (leaf == NULL)
+            continue;
+          for (addr_t i1 = 0; i1 < PAGING64_PT_ENTRIES; ++i1) {
+            if (leaf->entry[i1] == 0)
+              continue;
+            addr_t pgn = high | (i5 << (4 * sh)) | (i4 << (3 * sh)) |
+                         (i3 << (2 * sh)) | (i2 << sh) | i1;
+            fn(pgn, leaf->entry[i1], ctx);
+          }
+        }
+      }
+    }
+  }
+  pthread_mutex_unlock(&root->lock);
+  return 0;
+}
+
+/*
  * init_pte - build a PTE value in *@pte
  * @pre   : page present in RAM (ignored when @swp != 0)
  * @fpn   : frame number, 0 is a valid frame (16 bits in MM64)

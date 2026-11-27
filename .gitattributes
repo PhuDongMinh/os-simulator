@@ -1,0 +1,3 @@
+# Shell scripts must keep LF line endings: with CRLF, sh and make fail on
+# Linux/WSL ("Illegal option", "No such file or directory").
+*.sh text eol=lf

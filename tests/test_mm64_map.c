@@ -271,8 +271,55 @@ static void test_swap_cp_page(void)
   printf("PASS test_swap_cp_page\n");
 }
 
+/* mm64_pt_foreach visits non-zero PTEs in order, with canonical pgns */
+static addr_t seen_pgn[8], seen_pte[8];
+static int seen;
+static void collect(addr_t pgn, addr_t pte, void *ctx)
+{
+  (void)ctx;
+  assert(seen < 8);
+  seen_pgn[seen] = pgn;
+  seen_pte[seen++] = pte;
+}
+
+static void test_pt_foreach(void)
+{
+  setup(4, 0);
+  addr_t far = UBASE + ((addr_t)1 << 40);             /* other PGD/P4D path */
+  assert(pte_set_fpn(&mm, PGN(far), 3, NULL) == 0);
+  assert(pte_set_fpn(&mm, PGN(UBASE), 1, NULL) == 0);
+  assert(pte_set_fpn(&mm, PGN(UBASE + PG), 2, NULL) == 0);
+  assert(pte_clear_entry(&mm, PGN(UBASE + PG), NULL) == 0); /* zero: skipped */
+
+  seen = 0;
+  assert(mm64_pt_foreach(&mm, collect, NULL) == 0);
+  assert(seen == 2);
+  assert(seen_pgn[0] == PGN(UBASE) && PAGING_FPN(seen_pte[0]) == 1);
+  assert(seen_pgn[1] == PGN(far) && PAGING_FPN(seen_pte[1]) == 3);
+
+  /* kernel half: pgn comes back sign-extended (same value pte_* accept) */
+  struct mm_struct kmm;
+  memset(&kmm, 0, sizeof(kmm));
+  assert(init_mm(&kmm, NULL) == 0);
+  addr_t kpgn = PGN(PAGING64_KERNEL_VMA0_START + 5 * PG);
+  assert(pte_set_fpn(&kmm, kpgn, 7, NULL) == 0);
+  seen = 0;
+  assert(mm64_pt_foreach(&kmm, collect, NULL) == 0);
+  assert(seen == 1 && seen_pgn[0] == kpgn);
+  assert(mm64_pt_foreach(NULL, collect, NULL) == -1);
+  assert(mm64_pt_foreach(&kmm, NULL, NULL) == -1);
+
+  struct vm_area_struct *v = kmm.mmap;
+  free(v->vm_freerg_list);
+  free(v);
+  mm64_pgd_destroy(&kmm);
+  teardown();
+  printf("PASS test_pt_foreach\n");
+}
+
 int main(void)
 {
+  test_pt_foreach();
   test_map_basic();
   test_map_refused();
   test_evict_to_swap();

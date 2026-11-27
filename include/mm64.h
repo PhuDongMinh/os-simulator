@@ -100,6 +100,14 @@ extern "C" {
 int mm64_pgd_create(struct mm_struct *mm);
 void mm64_pgd_destroy(struct mm_struct *mm);
 
+/* Visit every non-zero PTE of @mm in increasing pgn order (pgn is the
+ * canonical page number, sign-extended for the kernel half).  The tree
+ * lock is held during the walk: @fn must not call pte_* on the same mm
+ * (MEMPHY_* is fine: pgd->lock -> memphy_lock).
+ * Return 0, or -1 if @mm/@fn is NULL or @mm has no root. */
+typedef void (*mm64_pte_visit_fn)(addr_t pgn, addr_t pte, void *ctx);
+int mm64_pt_foreach(struct mm_struct *mm, mm64_pte_visit_fn fn, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

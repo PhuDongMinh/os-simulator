@@ -1410,19 +1410,97 @@ int __write_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, B
 }
 
 
-/*free_pcb_memphy - collect all memphy of pcb
- *@caller: caller
- *@vmaid: ID vm area to alloc memory region
- *@incpgnum: number of page
+#ifdef MM64
+struct release_ctx {
+  struct krnl_t *krnl;
+  int failed;                   /* frames/slots MEMPHY refused to take back */
+};
+
+/* Swap device a swapped PTE points to (its SWPTYP field) */
+static struct memphy_struct *swap_dev_of(struct krnl_t *krnl, addr_t typ)
+{
+  if (typ >= PAGING_MAX_MMSWP)
+    return NULL;
+  if (krnl->mswp != NULL)
+    return krnl->mswp[typ];
+  return (typ == krnl->active_mswp_id) ? krnl->active_mswp : NULL;
+}
+
+/* mm64_pt_foreach callback: give one page's frame or swap slot back */
+static void release_page(addr_t pgn, addr_t pte, void *arg)
+{
+  struct release_ctx *rc = (struct release_ctx *)arg;
+  int r = 0;
+  (void)pgn;
+
+  if (pte & PAGING_PTE_SWAPPED_MASK) {
+    struct memphy_struct *dev = swap_dev_of(
+        rc->krnl, GETVAL(pte, PAGING_PTE_SWPTYP_MASK, PAGING_PTE_SWPTYP_LOBIT));
+    r = (dev != NULL) ? MEMPHY_put_freefp(dev, PAGING_PTE_SWP(pte)) : -1;
+  } else if (PAGING_PAGE_PRESENT(pte)) {
+    r = MEMPHY_put_freefp(rc->krnl->mram, PAGING_FPN(pte));
+  }
+  if (r != 0)
+    rc->failed++;
+}
+#endif
+
+/*free_pcb_memph - release the whole user address space of a process
+ *@caller: finished process; its DMA requests must be done (os.c waits)
+ *
+ * MM64: every RAM frame and swap slot referenced by caller->mm's PTEs goes
+ * back to its device (only through MEMPHY_put_freefp), then the page-table
+ * tree, the FIFO, the vm areas and their free-region lists are freed.
+ * The mm_struct itself stays (os.c frees it).  The kernel mm is never
+ * touched: kernel regions are released by __kfree.
+ * Return 0; -1 for invalid arguments or if some frame/slot was refused
+ * (e.g. a vmap_pgd_memset debug pattern, which owns no frame): everything
+ * is freed anyway.
  */
 int free_pcb_memph(struct pcb_t *caller)
 {
 #ifdef MM64
-  /* TODO(M1): walk the five-level tree, return every RAM frame and swap
-   * slot of caller->mm, then mm64_pgd_destroy(). Not implemented yet:
-   * os.c only calls mm64_pgd_destroy() for MM64. */
-  (void)caller;
-  return -1;
+  if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
+      caller->krnl->mram == NULL || caller->mm == caller->krnl->mm)
+    return -1;
+
+  struct mm_struct *mm = caller->mm;
+  struct release_ctx rc = {caller->krnl, 0};
+
+  pthread_mutex_lock(&mmvm_lock);
+
+  /* 1. Frames and swap slots, then the tree itself */
+  mm64_pt_foreach(mm, release_page, &rc);
+  mm64_pgd_destroy(mm);
+
+  /* 2. FIFO */
+  while (mm->fifo_pgn != NULL) {
+    struct pgn_t *next = mm->fifo_pgn->pg_next;
+    free(mm->fifo_pgn);
+    mm->fifo_pgn = next;
+  }
+
+  /* 3. vm areas and their free-region lists */
+  while (mm->mmap != NULL) {
+    struct vm_area_struct *vma = mm->mmap;
+    while (vma->vm_freerg_list != NULL) {
+      struct vm_rg_struct *next = vma->vm_freerg_list->rg_next;
+      free(vma->vm_freerg_list);
+      vma->vm_freerg_list = next;
+    }
+    mm->mmap = vma->vm_next;
+    free(vma);
+  }
+
+  /* 4. Symbol table entries are embedded: just forget them */
+  memset(mm->symrgtbl, 0, sizeof(mm->symrgtbl));
+
+  pthread_mutex_unlock(&mmvm_lock);
+
+  if (rc.failed > 0)
+    printf("[mm] WARNING: pid %u: %d frame(s)/swap slot(s) could not be returned\n",
+           caller->pid, rc.failed);
+  return (rc.failed > 0) ? -1 : 0;
 #else
   pthread_mutex_lock(&mmvm_lock);
   int pagenum, fpn;
