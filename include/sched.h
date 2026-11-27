@@ -27,6 +27,11 @@ void put_proc(struct pcb_t * proc); // End time slice
 /* Add a new process to ready queue */
 void add_proc(struct pcb_t * proc);
 
+/* A process has finished: remove it from the running list, before its PCB
+ * is freed (otherwise the list keeps a dangling pointer and, being a fixed
+ * array, eventually fills up) */
+void finish_proc(struct pcb_t * proc);
+
 #ifdef __cplusplus
 }
 #endif

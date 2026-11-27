@@ -189,8 +189,17 @@ void add_proc(struct pcb_t * proc) {
 
 	pthread_mutex_lock(&queue_lock);
 	enqueue(&ready_queue, proc);
-	pthread_mutex_unlock(&queue_lock);	
+	pthread_mutex_unlock(&queue_lock);
 }
 #endif
+
+/* Both policies put a dispatched process in running_list (get_proc) */
+void finish_proc(struct pcb_t * proc) {
+	if (proc == NULL)
+		return;
+	pthread_mutex_lock(&queue_lock);
+	purgequeue(&running_list, proc);
+	pthread_mutex_unlock(&queue_lock);
+}
 
 

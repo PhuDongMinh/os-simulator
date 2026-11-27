@@ -332,7 +332,7 @@ static void *cpu_routine(void *args)
 			if (proc->pc == proc->code->size) {
 				/* Cleanup order (API_CONTRACT §4.5):
 				 * DMA done -> unregister -> kernel regions -> user memory
-				 * -> mm -> PCB. */
+				 * -> mm -> running list -> PCB. */
 
 				/* 1. Last instruction done. The process may still have DMA
 				 * requests in flight: wait for them, so that its memory is
@@ -369,9 +369,8 @@ static void *cpu_routine(void *args)
 #endif
 				printf("\tCPU %d: Processed %2d has finished\n",
 				       id, proc->pid);
-				/* TODO(cleanup): the process must also be removed from
-				 * krnl->running_list under the scheduler's lock, which needs
-				 * a function from sched.c. */
+				/* 5. Leave the scheduler's running list, then free the PCB */
+				finish_proc(proc);
 				free(proc->code->text);
 				free(proc->code);
 				free(proc->page_table); /* legacy field, may be NULL */
