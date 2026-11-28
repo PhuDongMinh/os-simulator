@@ -95,8 +95,6 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
     return 0;
   }
 
-  /* TODO get_free_vmrg_area FAILED handle the region management (Fig.6)*/
-
   addr_t old_sbrk = cur_vma->sbrk;
 #ifdef MM64
   if (old_sbrk < cur_vma->vm_start || old_sbrk > cur_vma->vm_limit ||
@@ -108,9 +106,6 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
 #endif
   addr_t next_brk = old_sbrk + size;
 
-  /* TODO INCREASE THE LIMIT
-   * SYSCALL 1 sys_memmap
-   */
   struct sc_regs regs;
   regs.a1 = SYSMEM_INC_OP;
   regs.a2 = vmaid;
@@ -188,7 +183,6 @@ int __free(struct pcb_t *caller, int vmaid, int rgid)
     return -1;
   }
 
-  /* TODO: Manage the collect freed region to freerg_list */
   struct vm_rg_struct *rgnode = get_symrg_byid(caller->mm, rgid);
 
   if (rgnode->rg_start == 0 && rgnode->rg_end == 0)
@@ -225,7 +219,6 @@ int liballoc(struct pcb_t *proc, addr_t size, uint32_t reg_index)
     return -1;
   }
 #ifdef IODUMP
-  /* TODO dump IO content (if needed) */
 #ifdef PAGETBL_DUMP
   print_pgtbl(proc, 0, -1); // print max TBL
 #endif
@@ -250,7 +243,6 @@ int libfree(struct pcb_t *proc, uint32_t reg_index)
   }
 printf("%s:%d\n",__func__,__LINE__);
 #ifdef IODUMP
-  /* TODO dump IO content (if needed) */
 #ifdef PAGETBL_DUMP
   print_pgtbl(proc, 0, -1); // print max TBL
 #endif
@@ -387,11 +379,6 @@ int pg_getval(struct mm_struct *mm, addr_t addr, BYTE *data, struct pcb_t *calle
   int phyaddr = (fpn << PAGING_ADDR_FPN_LOBIT) + off;
 #endif
 
-  /* TODO  
-   *  MEMPHY_read(caller->krnl->mram, phyaddr, data);
-   *  MEMPHY READ 
-   *  SYSCALL 17 sys_memmap with SYSMEM_IO_READ
-   */
   struct sc_regs regs;
   regs.a1 = SYSMEM_IO_READ;
   regs.a2 = phyaddr;
@@ -424,12 +411,6 @@ int pg_setval(struct mm_struct *mm, addr_t addr, BYTE value, struct pcb_t *calle
   if (pg_getpage(mm, pgn, &fpn, caller) != 0)
     return -1; /* invalid page access */
 
-
-  /* TODO 
-   *  MEMPHY_write(caller->krnl->mram, phyaddr, value);
-   *  MEMPHY WRITE with SYSMEM_IO_WRITE 
-   * SYSCALL 17 sys_memmap
-   */
 #ifdef MM64
   int phyaddr = (fpn << PAGING64_ADDR_PT_SHIFT) + off;
 #else
@@ -456,7 +437,6 @@ int pg_setval(struct mm_struct *mm, addr_t addr, BYTE value, struct pcb_t *calle
 int __read(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data)
 {
   if (caller == NULL || caller->mm == NULL || data == NULL) return -1;
-  /* TODO Invalid memory identify */
   pthread_mutex_lock(&mmvm_lock);
 
   /* 1. NGaN TRUY CẬP KERNEL: Bắt buộc lấy thông tin vùng nhớ từ caller->mm (User Space) */
@@ -506,7 +486,6 @@ printf("%s:%d\n",__func__,__LINE__);
   if (val == 0)
     *destination = data;
 #ifdef IODUMP
-  /* TODO dump IO content (if needed) */
 #ifdef PAGETBL_DUMP
   print_pgtbl(proc, 0, -1); // print max TBL
 #endif
@@ -577,7 +556,6 @@ int libwrite(
     return -1;
   }
 #ifdef IODUMP
-  /* TODO dump IO content (if needed) */
 #ifdef PAGETBL_DUMP
   print_pgtbl(proc, 0, -1); // print max TBL
 #endif
@@ -609,15 +587,8 @@ int MEMPHY_get_freefp_contig(struct memphy_struct *mp, int num_pages, int *ret_f
 
 int libkmem_malloc(struct pcb_t * caller, uint32_t size, uint32_t reg_index)
 {
-  /* 
-   * TODO: provide OS level management
-   *       and forward the request to helper
-   */
   addr_t  addr;
   int val = __kmalloc(caller, 0, reg_index, size, &addr);
-  /* 
-   * TODO: provide OS kmem allocation validation
-   */
   if (val != 0) return -1; // Cấp phát thất bại
   return 0; 
 }
@@ -774,6 +745,11 @@ addr_t __kmalloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t 
   caller->kmap_slot[rgid] = kslot;
   *alloc_addr = vaddr;
 
+  printf("[Kernel__kmalloc] Thành công: Size = %llu bytes, VAddr = %llu, Physical Start Frame = %llu\n",
+         (unsigned long long)size,
+         (unsigned long long)vaddr,
+         (unsigned long long)start_fpn);
+
   pthread_mutex_unlock(&kmm_lock);
   return 0;
 }
@@ -831,6 +807,9 @@ int __kfree(struct pcb_t *caller, int vmaid, int rgid)
   rgnode->rg_next = NULL;
   caller->kmap_slot[rgid] = -1;
 
+  printf("[Kernel__kfree] Thành công: pid=%d rgid=%d kslot=%d pages=%d\n",
+         caller->pid, rgid, kslot, num_pages);
+  
   pthread_mutex_unlock(&kmm_lock);
   return 0;
 }
@@ -845,10 +824,6 @@ int libkmem_free(struct pcb_t *caller, uint32_t reg_index)
   if (val != 0) return -1;
   return 0; 
 }
-
-// Chính sách xóa PTE 64-bit: 
-      // Gọi hàm cấu hình PTE (nếu có) để xóa cờ PRESENT hoặc gán toàn bộ bit = 0
-      // Ví dụ: pte_set_fpn(caller->krnl->mm, pgn, 0, caller); // (Cần điều chỉnh bit PRESENT = 0 ben trong mm64.c)
 
 /* ------------------------------------------------------------------------
  * DMA memcpy support
@@ -1197,14 +1172,6 @@ int libmem_dma_memcpy(struct pcb_t *caller, uint32_t src, uint32_t dst, uint32_t
 
 int libkmem_copy_from_user(struct pcb_t *caller, uint32_t source, uint32_t destination, uint32_t offset, uint32_t size)
 {
-  /* TODO: provide OS level management kmem
-   */
-  /*
-   * TODO: Map kernel address range
-   */
-  //__read_user_mem(...)
-  //__write_kernel_mem(...);
-
   if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
       caller->krnl->mm == NULL || size == 0)
     return -1;
@@ -1257,13 +1224,6 @@ int libkmem_copy_from_user(struct pcb_t *caller, uint32_t source, uint32_t desti
 
 int libkmem_copy_to_user(struct pcb_t *caller, uint32_t source, uint32_t destination, uint32_t offset, uint32_t size)
 {
-  /* TODO: provide OS level management kmem
-   */
-  /*
-   * TODO: Map kernel address range
-   */
-  //__read_kernel_mem(...)
-  //__write_user_mem(...);
 
   if (caller == NULL || caller->mm == NULL || caller->krnl == NULL ||
       caller->krnl->mm == NULL || size == 0)
@@ -1330,8 +1290,6 @@ int __read_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, 
       data == NULL || rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ) 
     return -1;
 
-  /* TODO: provide OS memory operator for kernel memory region */
-  //krnl->krnl_pgd ... or krnl->pgd ... based on kmem implementation strategy
   pthread_mutex_lock(&kmm_lock);
   
   // 1. TTim vung nho ao Kernel
@@ -1397,8 +1355,6 @@ int __read_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, 
  */
 int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE value)
 {
-  /* TODO: provide OS memory operator for kernel memory region */
-  // krnl->krnl_pgd ... or krnl->pgd ... based on kmem implementation strategy
   if (caller == NULL || caller->krnl == NULL || caller->krnl->mm == NULL ||
       rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
     return -1;
@@ -1467,8 +1423,6 @@ int __write_kernel_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset,
  */
 int __read_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, BYTE *data)
 {
-  /* TODO: provide OS level management user memory access */
-  //krnl->pgd ... or krnl->krnl_pgd  ... based on kmem implementation strategy
   if (caller == NULL || caller->mm == NULL || data == NULL ||
       rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
     return -1;
@@ -1514,8 +1468,6 @@ int __write_user_mem(struct pcb_t *caller, int vmaid, int rgid, addr_t offset, B
   if (caller == NULL || caller->mm == NULL)
     return -1;
 
-  /* TODO: provide OS level management user memory access */
-  //krnl->pgd ... or krnl->krnl_pgd  ... based on kmem implementation strategy
   pthread_mutex_lock(&mmvm_lock);
 
   struct vm_rg_struct *currg = get_symrg_byid(caller->mm, rgid);
