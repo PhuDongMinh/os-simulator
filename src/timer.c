@@ -19,8 +19,10 @@ static int timer_stop = 0;
 
 
 static void * timer_routine(void * args) {
+	/* Slot 0 header: printed before any device can run (the loader and
+	 * CPU threads are created after start_timer()). */
+	printf("Time slot %3lu\n", current_time());
 	while (!timer_stop) {
-		printf("Time slot %3lu\n", current_time());
 		int fsh = 0;
 		int event = 0;
 		/* Wait for all devices have done the job in current
@@ -43,7 +45,13 @@ static void * timer_routine(void * args) {
 
 		/* Increase the time slot */
 		_time++;
-		
+
+		/* Print the header of the new slot BEFORE releasing the devices:
+		 * otherwise a device may print its first event of slot N before
+		 * "Time slot N" appears, under the header of slot N-1. */
+		if (fsh != event)
+			printf("Time slot %3lu\n", current_time());
+
 		/* Let devices continue their job */
 		for (temp = dev_list; temp != NULL; temp = temp->next) {
 			pthread_mutex_lock(&temp->id.timer_lock);
