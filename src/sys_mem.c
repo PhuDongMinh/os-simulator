@@ -75,7 +75,7 @@ int __sys_memmap(struct krnl_t *krnl, uint32_t pid, struct sc_regs *regs)
                 return -1;
         }
 
-        printf("[SYSCALL] sys_memmap found caller pid=%d\n", caller->pid);
+        //printf("[SYSCALL] sys_memmap found caller pid=%d\n", caller->pid);
 
         // Xu ly cac tac vu
         int stat = 0;
@@ -83,28 +83,28 @@ int __sys_memmap(struct krnl_t *krnl, uint32_t pid, struct sc_regs *regs)
         {
         case SYSMEM_MAP_OP:
                 /* Reserved process case*/
-                printf("[SYSCALL] sys_memmap MAP pid=%d start=%lu size=%lu\n", caller->pid, regs->a2, regs->a3);
+                //printf("[SYSCALL] sys_memmap MAP pid=%d start=%lu size=%lu\n", caller->pid, regs->a2, regs->a3);
                 stat = vmap_pgd_memset(caller, regs->a2, regs->a3);
                 break;
         case SYSMEM_INC_OP:
-                printf("[SYSCALL] sys_memmap INC pid=%d a2=%lu a3=%lu\n", caller->pid, regs->a2, regs->a3);
+                //printf("[SYSCALL] sys_memmap INC pid=%d a2=%lu a3=%lu\n", caller->pid, regs->a2, regs->a3);
                 stat = inc_vma_limit(caller, regs->a2, regs->a3);
                 break;
         case SYSMEM_SWP_OP:
-                printf("[SYSCALL] sys_memmap SWAP pid=%d pgn=%lu swp=%lu\n", caller->pid, regs->a2, regs->a3);
+                //printf("[SYSCALL] sys_memmap SWAP pid=%d pgn=%lu swp=%lu\n", caller->pid, regs->a2, regs->a3);
                 stat = __mm_swap_page(caller, regs->a2, regs->a3);
                 break;
         case SYSMEM_IO_READ:
                 stat = MEMPHY_read(krnl->mram, regs->a2, &value);
                 if (stat == 0) regs->a3 = value;  //Tra du lieu doc duoc qua reg a3
-                printf("[SYSCALL] sys_memmap IO_READ pid=%d addr=%lu value=%u\n", caller->pid, regs->a2, value);
+                //printf("[SYSCALL] sys_memmap IO_READ pid=%d addr=%lu value=%u\n", caller->pid, regs->a2, value);
                 break;
         case SYSMEM_IO_WRITE:
                 stat = MEMPHY_write(krnl->mram, regs->a2, regs->a3);
-                printf("[SYSCALL] sys_memmap IO_WRITE pid=%d addr=%lu value=%lu\n", caller->pid, regs->a2, regs->a3);
+                //printf("[SYSCALL] sys_memmap IO_WRITE pid=%d addr=%lu value=%lu\n", caller->pid, regs->a2, regs->a3);
                 break;
         default:
-                printf("[SYSCALL] sys_memmap UNKNOWN pid=%d memop=%d a2=%lu a3=%lu\n", caller->pid, memop, regs->a2, regs->a3);
+                //printf("[SYSCALL] sys_memmap UNKNOWN pid=%d memop=%d a2=%lu a3=%lu\n", caller->pid, memop, regs->a2, regs->a3);
                 stat = -1;
                 break;
         }

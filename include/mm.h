@@ -121,7 +121,8 @@ extern "C" {
 /* Memory range operator */
 /* TODO implement the INCLUDE and OVERLAP checking mechanism */
 #define INCLUDE(x1,x2,y1,y2) (0)
-#define OVERLAP(x1,x2,y1,y2) (0)
+#define OVERLAP(x1, x2, y1, y2) \
+    ((x1) < (y2) && (y1) < (x2))
 
 /* VM region prototypes */
 struct vm_rg_struct * init_vm_rg(addr_t rg_start, addr_t rg_end);
@@ -187,6 +188,7 @@ int pgwrite(
 struct vm_rg_struct * get_symrg_byid(struct mm_struct* mm, int rgid);
 int validate_overlap_vm_area(struct pcb_t *caller, int vmaid, addr_t vmastart, addr_t vmaend);
 int get_free_vmrg_area(struct pcb_t *caller, int vmaid, addr_t size, struct vm_rg_struct *newrg);
+struct vm_rg_struct *get_vm_area_node_at_brk(struct pcb_t *caller, int vmaid, addr_t addr);
 int inc_vma_limit(struct pcb_t *caller, int vmaid, addr_t inc_sz);
 /* Global FIFO (caller->krnl->fifo_pgn): detach the oldest evictable page of
  * any process; *vicmm receives its owner, *pgn its page number. */

@@ -8,17 +8,14 @@
  * for the sole purpose of studying while attending the course CO2018.
  */
 
-//#ifdef MM_PAGING
 /*
  * PAGING based Memory Management
  * Virtual memory module mm/mm-vm.c
  */
 
-#include "string.h"
 #include "mm64.h"
+#include <limits.h>
 #include <stdlib.h>
-#include <stdio.h>
-#include <pthread.h>
 
 /*get_vma_by_num - get vm area by numID
  *@mm: memory region
@@ -40,6 +37,7 @@ struct vm_area_struct *get_vma_by_num(struct mm_struct *mm, int vmaid)
       return NULL;
 
     pvma = pvma->vm_next;
+    if (pvma == NULL) return NULL;
     vmait = pvma->vm_id;
   }
 
@@ -80,6 +78,12 @@ struct vm_rg_struct *get_vm_area_node_at_brk(struct pcb_t *caller, int vmaid, ad
   // struct vm_area_struct *cur_vma=....
 
   /* END TODO */
+  struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
+
+  newrg = malloc(sizeof(struct vm_rg_struct));
+
+  newrg->rg_start = cur_vma->sbrk;
+  newrg->rg_end = newrg->rg_start + alignedsz;
 
   return newrg;
 }
@@ -146,9 +150,45 @@ int inc_vma_limit(struct pcb_t *caller, int vmaid, addr_t inc_sz)
    */
 
   /* TODO: Obtain the new vm area based on vmaid */
+    struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
 
+    if (cur_vma == NULL || inc_sz == 0) return -1;
 
-  return 0;
+    addr_t old_sbrk = cur_vma->sbrk;
+    addr_t old_end = cur_vma->vm_end;
+
+    addr_t new_sbrk = old_sbrk + inc_sz;
+    addr_t new_end = PAGING64_PAGE_ALIGNSZ(new_sbrk);
+
+    if (new_end < old_end) new_end = old_end;
+
+    addr_t inc_amt = new_end - old_end;
+    addr_t incnumpage = inc_amt / PAGING64_PAGESZ;
+
+    /* Validate overlap */
+    if (validate_overlap_vm_area(caller, vmaid,
+                                cur_vma->vm_start, new_end) < 0)
+        return -1;
+
+    /* Map additional pages to RAM */
+    if (incnumpage > 0)
+    {
+        struct vm_rg_struct *newrg;
+
+        if (vm_map_ram(caller,
+                       cur_vma->vm_start,
+                       new_end,
+                       old_end,
+                       (int)incnumpage,
+                       newrg) != 0)
+            return -1;
+    }
+
+    /* Update VMA after successful mapping */
+    cur_vma->vm_end = new_end;
+    cur_vma->sbrk = new_sbrk;
+
+    return 0;
 }
 
 // #endif

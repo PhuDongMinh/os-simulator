@@ -74,20 +74,12 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
   pthread_mutex_lock(&mmvm_lock);
   struct vm_rg_struct rgnode;
   struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
+  int inc_sz=0;
 
-  if (cur_vma == NULL || rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ || size == 0)
-  {
-    pthread_mutex_unlock(&mmvm_lock);
-    return -1;
-  }
-
-  //vma đó còn đủ chỗ để cấp phát (get trả về 0) -> cập nhật vma, trả về alloc_addr = start
   if (get_free_vmrg_area(caller, vmaid, size, &rgnode) == 0)
   {
     caller->mm->symrgtbl[rgid].rg_start = rgnode.rg_start;
     caller->mm->symrgtbl[rgid].rg_end = rgnode.rg_end;
-    if (rgnode.rg_end > cur_vma->sbrk)
-      cur_vma->sbrk = rgnode.rg_end;
  
     *alloc_addr = rgnode.rg_start;
 
@@ -97,16 +89,17 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
 
   /* TODO get_free_vmrg_area FAILED handle the region management (Fig.6)*/
 
-  addr_t old_sbrk = cur_vma->sbrk;
+  /*Attempt to increate limit to get space */
 #ifdef MM64
-  if (old_sbrk < cur_vma->vm_start || old_sbrk > cur_vma->vm_limit ||
-      size - 1 > cur_vma->vm_limit - old_sbrk)
-  {
-    pthread_mutex_unlock(&mmvm_lock);
-    return -1;
-  }
+  inc_sz = (uint32_t)(size/(int)PAGING64_PAGESZ);
+  inc_sz = inc_sz + 1;
+#else
+  inc_sz = PAGING_PAGE_ALIGNSZ(size);
 #endif
-  addr_t next_brk = old_sbrk + size;
+  int old_sbrk;
+  inc_sz = inc_sz + 1;
+
+  old_sbrk = cur_vma->sbrk;
 
   /* TODO INCREASE THE LIMIT
    * SYSCALL 1 sys_memmap
@@ -115,54 +108,14 @@ int __alloc(struct pcb_t *caller, int vmaid, int rgid, addr_t size, addr_t *allo
   regs.a1 = SYSMEM_INC_OP;
   regs.a2 = vmaid;
 #ifdef MM64
-  regs.a3 = size;
+  regs.a3 = PAGING64_PAGE_ALIGNSZ(size);
 #else
   regs.a3 = PAGING_PAGE_ALIGNSZ(size);
 #endif  
   _syscall(caller->krnl, caller->pid, 17, &regs); /* SYSCALL 17 sys_memmap */
-  if (cur_vma->vm_end < next_brk)
-  {
-    addr_t map_start = cur_vma->vm_end;
-#ifdef MM64
-    addr_t align_sz = PAGING64_PAGE_ALIGNSZ(next_brk - map_start);
-    addr_t incpgnum = align_sz / PAGING64_PAGESZ;
-#else
-    addr_t align_sz = PAGING_PAGE_ALIGNSZ(size);
-    addr_t incpgnum = align_sz / PAGING_PAGESZ;
-#endif
-    if (incpgnum > INT_MAX ||
-        (int64_t)vm_map_ram(caller, cur_vma->vm_start, map_start + align_sz,
-                            map_start, (int)incpgnum, NULL) < 0)
-    {
-      pthread_mutex_unlock(&mmvm_lock);
-      return -1;
-    }
-    /* The allocation also consumes any free tail of the previous mapping. */
-    if (old_sbrk < map_start)
-    {
-      struct vm_rg_struct *free_rg = cur_vma->vm_freerg_list;
-      while (free_rg != NULL)
-      {
-        if (free_rg->rg_start == old_sbrk && free_rg->rg_end == map_start)
-        {
-          free_rg->rg_start = free_rg->rg_end;
-          break;
-        }
-        free_rg = free_rg->rg_next;
-      }
-    }
-    cur_vma->vm_end = map_start + align_sz;
-    if (next_brk < cur_vma->vm_end)
-    {
-      struct vm_rg_struct *left_rg = init_vm_rg(next_brk, cur_vma->vm_end);
-      if (left_rg != NULL)
-        enlist_vm_freerg_list(caller->mm, left_rg);
-    }
-  }
   /*Successful increase limit */
-  cur_vma->sbrk = next_brk;
   caller->mm->symrgtbl[rgid].rg_start = old_sbrk;
-  caller->mm->symrgtbl[rgid].rg_end = next_brk;
+  caller->mm->symrgtbl[rgid].rg_end = old_sbrk + size;
 
   *alloc_addr = old_sbrk;
 
@@ -182,7 +135,7 @@ int __free(struct pcb_t *caller, int vmaid, int rgid)
 {
   pthread_mutex_lock(&mmvm_lock);
 
-  if (rgid < 0 || rgid >= PAGING_MAX_SYMTBL_SZ)
+  if (rgid < 0 || rgid > PAGING_MAX_SYMTBL_SZ)
   {
     pthread_mutex_unlock(&mmvm_lock);
     return -1;
